@@ -1,0 +1,12 @@
+{
+  "event_type": "Conference",
+  "zones": [
+    {"name": "VIP", "empty_threshold_minutes": 10},
+    {"name": "Standard", "empty_threshold_minutes": 15}
+  ],
+  "detection_interval_seconds": 7,
+  "stability_required_scans": 3,
+  "seat_detection_radius_pixels": 100,
+  "person_detection_confidence_threshold": 0.25,
+  "debug_detection": true
+}
