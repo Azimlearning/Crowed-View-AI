@@ -1,12 +1,22 @@
 {
   "event_type": "Conference",
   "zones": [
-    {"name": "VIP", "empty_threshold_minutes": 10},
-    {"name": "Standard", "empty_threshold_minutes": 15}
+    {
+      "name": "VIP",
+      "empty_threshold_minutes": 10
+    },
+    {
+      "name": "Standard",
+      "empty_threshold_minutes": 15
+    }
   ],
   "detection_interval_seconds": 7,
+  "occupancy_overlap_threshold": 0.6,
+  "occupancy_confirmation_seconds": 30,
+  "vacancy_grace_period_minutes": 20,
+  "testing_mode": false,
+  "person_detection_confidence_threshold": 0.3,
+  "debug_detection": true,
   "stability_required_scans": 3,
-  "seat_detection_radius_pixels": 100,
-  "person_detection_confidence_threshold": 0.25,
-  "debug_detection": true
+  "seat_detection_radius_pixels": 100
 }

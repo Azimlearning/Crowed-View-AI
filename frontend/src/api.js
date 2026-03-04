@@ -76,4 +76,34 @@ export const getSuggestions = async (zoneName) => {
   }
 };
 
+export const getConfig = async () => {
+  try {
+    const response = await api.get('/api/config');
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      throw new Error(`Server error: ${error.response.status} - ${error.response.data?.detail || 'Unknown error'}`);
+    } else if (error.request) {
+      throw new Error('Network error: Could not reach the backend server.');
+    } else {
+      throw new Error(`Request error: ${error.message}`);
+    }
+  }
+};
+
+export const updateConfig = async (configUpdate) => {
+  try {
+    const response = await api.post('/api/config', configUpdate);
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      throw new Error(`Server error: ${error.response.status} - ${error.response.data?.detail || 'Unknown error'}`);
+    } else if (error.request) {
+      throw new Error('Network error: Could not reach the backend server.');
+    } else {
+      throw new Error(`Request error: ${error.message}`);
+    }
+  }
+};
+
 export default api;

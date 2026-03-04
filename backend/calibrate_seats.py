@@ -1,6 +1,7 @@
 """
 Interactive seat calibration tool for Venue Intelligence AI.
-Click to place seats, drag to adjust, right-click to delete.
+Click to place rectangular seat areas, drag to adjust, right-click to delete.
+Updated to use rectangular seat areas instead of circles.
 """
 import sys
 import json
@@ -12,20 +13,23 @@ from typing import List, Tuple, Optional
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 
-# Default detection radius (will be read from config)
-DEFAULT_RADIUS = 65
+# Default seat dimensions
+DEFAULT_WIDTH = 100
+DEFAULT_HEIGHT = 100
 
 
 class SeatCalibrator:
-    """Interactive seat calibration tool."""
+    """Interactive seat calibration tool using rectangular seat areas."""
     
     def __init__(self, seating_map_path: str, config_path: str):
         self.seating_map_path = Path(seating_map_path)
         self.config_path = Path(config_path)
         self.seats: List[dict] = []
         self.dragging_seat: Optional[int] = None
+        self.resizing_seat: Optional[int] = None  # For resize mode
         self.current_zone = "VIP"
-        self.radius = DEFAULT_RADIUS
+        self.seat_width = DEFAULT_WIDTH
+        self.seat_height = DEFAULT_HEIGHT
         
         # Load existing seats if file exists
         self._load_existing_seats()
@@ -41,12 +45,15 @@ class SeatCalibrator:
         cv2.setMouseCallback(self.window_name, self._mouse_callback)
         
     def _load_config(self):
-        """Load detection radius from config."""
+        """Load default seat dimensions from config if available."""
         try:
             if self.config_path.exists():
                 with open(self.config_path, 'r') as f:
                     config = json.load(f)
-                    self.radius = config.get('seat_detection_radius_pixels', DEFAULT_RADIUS)
+                    # Use radius as fallback for width/height if no explicit defaults
+                    radius = config.get('seat_detection_radius_pixels', 50)
+                    self.seat_width = DEFAULT_WIDTH
+                    self.seat_height = DEFAULT_HEIGHT
         except Exception as e:
             print(f"Warning: Could not load config: {e}")
     
@@ -60,6 +67,9 @@ class SeatCalibrator:
                     for zone in data.get('zones', []):
                         for seat in zone.get('seats', []):
                             seat['zone'] = zone['name']
+                            # Ensure width/height exist
+                            seat.setdefault('width', DEFAULT_WIDTH)
+                            seat.setdefault('height', DEFAULT_HEIGHT)
                             self.seats.append(seat)
             except Exception as e:
                 print(f"Warning: Could not load existing seats: {e}")
@@ -98,28 +108,44 @@ class SeatCalibrator:
     def _mouse_callback(self, event, x, y, flags, param):
         """Handle mouse events."""
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Check if clicking on existing seat
-            clicked_seat_idx = self._get_seat_at_position(x, y)
-            if clicked_seat_idx is not None:
-                self.dragging_seat = clicked_seat_idx
+            # Check if clicking on the resize handle (bottom-right corner) of an existing seat
+            resize_idx = self._get_resize_handle_at(x, y)
+            if resize_idx is not None:
+                self.resizing_seat = resize_idx
             else:
-                # Add new seat
-                seat_id = f"{self.current_zone.lower()}_{len([s for s in self.seats if s.get('zone') == self.current_zone]) + 1}"
-                self.seats.append({
-                    'id': seat_id,
-                    'x': x,
-                    'y': y,
-                    'zone': self.current_zone
-                })
+                # Check if clicking inside an existing seat
+                clicked_seat_idx = self._get_seat_at_position(x, y)
+                if clicked_seat_idx is not None:
+                    self.dragging_seat = clicked_seat_idx
+                else:
+                    # Add new seat (x,y is top-left corner)
+                    seat_id = f"{self.current_zone.lower()}_{len([s for s in self.seats if s.get('zone') == self.current_zone]) + 1}"
+                    self.seats.append({
+                        'id': seat_id,
+                        'x': x,
+                        'y': y,
+                        'width': self.seat_width,
+                        'height': self.seat_height,
+                        'zone': self.current_zone
+                    })
         
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.dragging_seat is not None:
-                # Update seat position
-                self.seats[self.dragging_seat]['x'] = max(0, min(CAMERA_WIDTH - 1, x))
-                self.seats[self.dragging_seat]['y'] = max(0, min(CAMERA_HEIGHT - 1, y))
+                # Move seat (keep within bounds)
+                seat = self.seats[self.dragging_seat]
+                seat['x'] = max(0, min(CAMERA_WIDTH - seat['width'], x))
+                seat['y'] = max(0, min(CAMERA_HEIGHT - seat['height'], y))
+            elif self.resizing_seat is not None:
+                # Resize seat
+                seat = self.seats[self.resizing_seat]
+                new_w = max(20, x - seat['x'])
+                new_h = max(20, y - seat['y'])
+                seat['width'] = min(new_w, CAMERA_WIDTH - seat['x'])
+                seat['height'] = min(new_h, CAMERA_HEIGHT - seat['y'])
         
         elif event == cv2.EVENT_LBUTTONUP:
             self.dragging_seat = None
+            self.resizing_seat = None
         
         elif event == cv2.EVENT_RBUTTONDOWN:
             # Delete seat
@@ -128,19 +154,29 @@ class SeatCalibrator:
                 self.seats.pop(clicked_seat_idx)
     
     def _get_seat_at_position(self, x: int, y: int) -> Optional[int]:
-        """Get seat index at given position."""
+        """Get seat index at given position (checks if point is inside rectangle)."""
         for i, seat in enumerate(self.seats):
             sx, sy = seat['x'], seat['y']
-            distance = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
-            if distance < self.radius:
+            sw, sh = seat['width'], seat['height']
+            if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                return i
+        return None
+    
+    def _get_resize_handle_at(self, x: int, y: int, handle_size: int = 12) -> Optional[int]:
+        """Check if click is on the resize handle (bottom-right corner) of a seat."""
+        for i, seat in enumerate(self.seats):
+            corner_x = seat['x'] + seat['width']
+            corner_y = seat['y'] + seat['height']
+            if abs(x - corner_x) < handle_size and abs(y - corner_y) < handle_size:
                 return i
         return None
     
     def _draw_overlay(self, frame):
-        """Draw seat markers and instructions on frame."""
+        """Draw seat rectangles and instructions on frame."""
         # Draw seats
         for seat in self.seats:
             x, y = seat['x'], seat['y']
+            w, h = seat['width'], seat['height']
             zone = seat.get('zone', 'Unknown')
             
             # Color by zone
@@ -149,20 +185,28 @@ class SeatCalibrator:
             else:
                 color = (255, 0, 255)  # Magenta
             
-            # Draw circle
-            cv2.circle(frame, (x, y), self.radius, color, 2)
-            cv2.circle(frame, (x, y), 3, color, -1)
+            # Draw rectangle
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
             
-            # Draw seat ID
-            cv2.putText(frame, seat['id'], (x - 20, y - self.radius - 10),
+            # Draw resize handle (small filled square at bottom-right)
+            handle_size = 6
+            cv2.rectangle(frame, (x + w - handle_size, y + h - handle_size),
+                         (x + w + handle_size, y + h + handle_size), color, -1)
+            
+            # Draw seat ID and dimensions
+            label = f"{seat['id']} ({w}x{h})"
+            cv2.putText(frame, label, (x, y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
         # Draw instructions
         instructions = [
-            "LEFT CLICK: Add seat",
-            "DRAG: Move seat",
+            "LEFT CLICK: Add seat (top-left corner)",
+            "DRAG SEAT: Move seat",
+            "DRAG CORNER: Resize seat",
             "RIGHT CLICK: Delete seat",
             f"ZONE: {self.current_zone} (Press 1-9 to change)",
+            f"Default size: {self.seat_width}x{self.seat_height}",
+            "W/H: Increase default width/height",
             "S: Save and exit",
             "Q: Quit without saving",
             "C: Clear all seats"
@@ -170,8 +214,8 @@ class SeatCalibrator:
         
         y_offset = 20
         for i, text in enumerate(instructions):
-            cv2.putText(frame, text, (10, y_offset + i * 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, text, (10, y_offset + i * 18),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         # Draw zone summary
         zones = {}
@@ -199,7 +243,9 @@ class SeatCalibrator:
             seat_entry = {
                 'id': seat['id'],
                 'x': seat['x'],
-                'y': seat['y']
+                'y': seat['y'],
+                'width': seat.get('width', DEFAULT_WIDTH),
+                'height': seat.get('height', DEFAULT_HEIGHT)
             }
             zones_dict[zone_name].append(seat_entry)
         
@@ -224,13 +270,18 @@ class SeatCalibrator:
     def run(self):
         """Run calibration tool."""
         print("\n" + "=" * 60)
-        print("Seat Calibration Tool")
+        print("Seat Calibration Tool (Rectangle Mode)")
         print("=" * 60)
         print("\nControls:")
-        print("  LEFT CLICK: Add seat at cursor position")
-        print("  DRAG: Move existing seat")
+        print("  LEFT CLICK: Add seat at cursor position (top-left corner)")
+        print("  DRAG INSIDE SEAT: Move seat")
+        print("  DRAG BOTTOM-RIGHT CORNER: Resize seat")
         print("  RIGHT CLICK: Delete seat")
         print("  1-9: Change zone (1=VIP, 2=Standard, etc.)")
+        print("  W: Increase default width (+10)")
+        print("  H: Increase default height (+10)")
+        print("  SHIFT+W: Decrease default width (-10)")
+        print("  SHIFT+H: Decrease default height (-10)")
         print("  S: Save and exit")
         print("  Q: Quit without saving")
         print("  C: Clear all seats")
@@ -272,6 +323,18 @@ class SeatCalibrator:
                     if confirm.lower() == 'y':
                         self.seats = []
                         print("All seats cleared")
+            elif key == ord('w'):
+                self.seat_width = max(20, self.seat_width + 10)
+                print(f"Default seat width: {self.seat_width}")
+            elif key == ord('W'):
+                self.seat_width = max(20, self.seat_width - 10)
+                print(f"Default seat width: {self.seat_width}")
+            elif key == ord('h'):
+                self.seat_height = max(20, self.seat_height + 10)
+                print(f"Default seat height: {self.seat_height}")
+            elif key == ord('H'):
+                self.seat_height = max(20, self.seat_height - 10)
+                print(f"Default seat height: {self.seat_height}")
             elif key in zone_map:
                 self.current_zone = zone_map[key]
                 print(f"Zone changed to: {self.current_zone}")

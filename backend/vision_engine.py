@@ -1,5 +1,10 @@
 """
 Vision engine for detecting seat occupancy using YOLOv8-Nano.
+
+Uses area-based overlap (60% rule) with temporal confirmation:
+- Occupancy: 60% overlap sustained for 30 seconds → Occupied
+- Vacancy: 20-minute grace period after person leaves → Empty
+- Testing mode: bypasses all timers for instant updates
 """
 import os
 # PyTorch 2.6+ defaults to weights_only=True; YOLO checkpoints need weights_only=False (trusted Ultralytics source)
@@ -17,7 +22,7 @@ import threading
 from datetime import datetime, timedelta
 from math import sqrt
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 from ultralytics import YOLO
@@ -45,10 +50,13 @@ class VisionEngine:
         self._last_frame = None  # for debug snapshot (single frame, not history)
         self._is_video_file = False  # Track if using video file instead of camera
         self._last_person_detections = None  # Store last detections for visualization
-        self._seat_scores: Dict[str, int] = {}  # Per-seat hysteresis score (-5 to +5) when use_hysteresis
         self._detection_roi = None  # (x_min, y_min, x_max, y_max) for ROI-based YOLO; None = full frame
         self._prev_gray = None  # Last frame grayscale (blurred) for motion check
         self._last_forced_detection_time = 0.0  # When we last ran YOLO (for 30s forced interval)
+
+        # Temporal tracking for new occupancy logic
+        self._seat_first_overlap_time: Dict[str, Optional[datetime]] = {}  # When 60% overlap first started
+        self._seat_last_overlap: Dict[str, float] = {}  # Last computed overlap per seat
 
         self._load_config()
         self._load_seating_map()
@@ -69,10 +77,12 @@ class VisionEngine:
         # Validate config values
         if self.config.detection_interval_seconds <= 0:
             errors.append("detection_interval_seconds must be positive")
-        if self.config.stability_required_scans <= 0:
-            errors.append("stability_required_scans must be positive")
-        if self.config.seat_detection_radius_pixels <= 0:
-            errors.append("seat_detection_radius_pixels must be positive")
+        if not (0.0 < self.config.occupancy_overlap_threshold <= 1.0):
+            errors.append("occupancy_overlap_threshold must be between 0.0 and 1.0")
+        if self.config.occupancy_confirmation_seconds < 0:
+            errors.append("occupancy_confirmation_seconds must be non-negative")
+        if self.config.vacancy_grace_period_minutes < 0:
+            errors.append("vacancy_grace_period_minutes must be non-negative")
         if not (0.0 <= self.config.person_detection_confidence_threshold <= 1.0):
             errors.append("person_detection_confidence_threshold must be between 0.0 and 1.0")
         
@@ -80,33 +90,23 @@ class VisionEngine:
         CAMERA_WIDTH = 640
         CAMERA_HEIGHT = 480
         
-        # Check seat coordinates and detect overlaps
-        radius = self.config.seat_detection_radius_pixels
-        seat_positions = []
-        
         for zone_name, zone in self.zones.items():
             # Validate zone threshold
             if zone.empty_threshold_minutes <= 0:
                 errors.append(f"Zone '{zone_name}' empty_threshold_minutes must be positive")
             
             for seat in zone.seats:
-                # Validate coordinates
+                # Validate seat rectangle stays within camera bounds
                 if seat.x < 0 or seat.x >= CAMERA_WIDTH:
-                    errors.append(f"Seat '{seat.id}' x coordinate {seat.x} is out of bounds (0-{CAMERA_WIDTH-1})")
+                    warnings.append(f"Seat '{seat.id}' x coordinate {seat.x} is out of bounds (0-{CAMERA_WIDTH-1})")
                 if seat.y < 0 or seat.y >= CAMERA_HEIGHT:
-                    errors.append(f"Seat '{seat.id}' y coordinate {seat.y} is out of bounds (0-{CAMERA_HEIGHT-1})")
-                
-                # Check for overlapping detection radii (warn only; allow larger radius for better detection)
-                for other_seat_pos in seat_positions:
-                    other_id, other_x, other_y = other_seat_pos
-                    distance = sqrt((seat.x - other_x) ** 2 + (seat.y - other_y) ** 2)
-                    min_distance = 2 * radius + 20  # Recommended spacing
-                    if distance < 2 * radius:
-                        warnings.append(f"Seat '{seat.id}' detection radius overlaps with seat '{other_id}' (distance: {distance:.1f}px)")
-                    elif distance < min_distance:
-                        warnings.append(f"Seat '{seat.id}' is close to '{other_id}' (distance: {distance:.1f}px, recommended: {min_distance}px)")
-                
-                seat_positions.append((seat.id, seat.x, seat.y))
+                    warnings.append(f"Seat '{seat.id}' y coordinate {seat.y} is out of bounds (0-{CAMERA_HEIGHT-1})")
+                if seat.x + seat.width > CAMERA_WIDTH:
+                    warnings.append(f"Seat '{seat.id}' extends beyond camera width (x={seat.x}, w={seat.width})")
+                if seat.y + seat.height > CAMERA_HEIGHT:
+                    warnings.append(f"Seat '{seat.id}' extends beyond camera height (y={seat.y}, h={seat.height})")
+                if seat.width <= 0 or seat.height <= 0:
+                    errors.append(f"Seat '{seat.id}' width/height must be positive")
         
         # Check for zones in config.json that don't have seats
         config_zone_names = {zc.name for zc in self.config.zones}
@@ -147,11 +147,15 @@ class VisionEngine:
                     id=seat_data['id'],
                     x=seat_data['x'],
                     y=seat_data['y'],
+                    width=seat_data.get('width', 100),
+                    height=seat_data.get('height', 100),
                     zone=zone_name,
                     status="Empty",
                     stability_counter=0,
-                    last_empty_time=None,  # Only set when transitioning from Occupied to Empty
-                    is_actionable=False
+                    last_empty_time=None,
+                    is_actionable=False,
+                    overlap_percentage=0.0,
+                    vacancy_timer_start=None
                 )
                 self.seats[seat.id] = seat
                 seats_list.append(seat)
@@ -163,23 +167,26 @@ class VisionEngine:
             )
             self.zones[zone_name] = zone
 
-        # Initialize hysteresis scores when hysteresis is used (keep existing scores if reloading)
-        self._seat_scores = {sid: self._seat_scores.get(sid, 0) for sid in self.seats}
+        # Initialize temporal tracking
+        for sid in self.seats:
+            if sid not in self._seat_first_overlap_time:
+                self._seat_first_overlap_time[sid] = None
+            if sid not in self._seat_last_overlap:
+                self._seat_last_overlap[sid] = 0.0
         
         # Validate configuration after loading
         self._validate_configuration()
 
     def _compute_detection_roi(self) -> None:
-        """Compute ROI bounding box from seat positions (radius + 50 margin), clamped to 640x480."""
+        """Compute ROI bounding box from seat positions (margin around seat rects), clamped to 640x480."""
         if not self.seats:
             self._detection_roi = None
             return
-        radius = self.config.seat_detection_radius_pixels
-        margin = radius + 50
+        margin = 50
         x_min = min(s.x for s in self.seats.values()) - margin
         y_min = min(s.y for s in self.seats.values()) - margin
-        x_max = max(s.x for s in self.seats.values()) + margin
-        y_max = max(s.y for s in self.seats.values()) + margin
+        x_max = max(s.x + s.width for s in self.seats.values()) + margin
+        y_max = max(s.y + s.height for s in self.seats.values()) + margin
         x_min = max(0, min(x_min, 639))
         y_min = max(0, min(y_min, 479))
         x_max = max(0, min(x_max, 640))
@@ -227,20 +234,157 @@ class VisionEngine:
         self._prev_gray = blurred.copy()
         return cv2.countNonZero(thresh) >= pixel_threshold
 
-    @staticmethod
-    def _box_overlaps_circle(x1: int, y1: int, x2: int, y2: int, cx: int, cy: int, radius: int) -> bool:
-        """Check if bounding box (x1,y1,x2,y2) overlaps circle centered at (cx,cy) with given radius."""
-        nearest_x = max(x1, min(cx, x2))
-        nearest_y = max(y1, min(cy, y2))
-        distance = sqrt((nearest_x - cx) ** 2 + (nearest_y - cy) ** 2)
-        return distance <= radius
+    # -----------------------------------------------------------------------
+    # Area-based overlap computation
+    # -----------------------------------------------------------------------
 
     @staticmethod
-    def _distance_box_to_point(x1: int, y1: int, x2: int, y2: int, px: int, py: int) -> float:
-        """Distance from circle center to nearest point on bounding box (for closest-seat tiebreak)."""
-        nearest_x = max(x1, min(px, x2))
-        nearest_y = max(y1, min(py, y2))
-        return sqrt((nearest_x - px) ** 2 + (nearest_y - py) ** 2)
+    def _compute_rect_intersection_area(
+        ax1: int, ay1: int, ax2: int, ay2: int,
+        bx1: int, by1: int, bx2: int, by2: int
+    ) -> int:
+        """Compute the intersection area of two axis-aligned rectangles.
+        
+        Each rectangle is defined by (x1, y1, x2, y2) where (x1,y1) is the
+        top-left corner and (x2,y2) is the bottom-right corner.
+        
+        Returns:
+            Intersection area in pixels squared, or 0 if no overlap.
+        """
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0
+        return (ix2 - ix1) * (iy2 - iy1)
+
+    def compute_seat_overlap(
+        self,
+        seat: Seat,
+        person_detections: List[Tuple[int, int, int, int]]
+    ) -> float:
+        """Compute cumulative overlap percentage for a seat.
+        
+        Multiple person bounding boxes can contribute to the same seat.
+        Their individual intersection areas are summed and divided by the seat area.
+        The result is capped at 1.0.
+        
+        Args:
+            seat: The Seat object (defines the static area A1).
+            person_detections: List of (x1, y1, x2, y2) bounding boxes (dynamic area A2).
+            
+        Returns:
+            Overlap fraction (0.0 to 1.0).
+        """
+        seat_x1 = seat.x
+        seat_y1 = seat.y
+        seat_x2 = seat.x + seat.width
+        seat_y2 = seat.y + seat.height
+        seat_area = seat.width * seat.height
+        if seat_area <= 0:
+            return 0.0
+
+        total_intersection = 0
+        for (px1, py1, px2, py2) in person_detections:
+            total_intersection += self._compute_rect_intersection_area(
+                seat_x1, seat_y1, seat_x2, seat_y2,
+                px1, py1, px2, py2
+            )
+
+        return min(total_intersection / seat_area, 1.0)
+
+    # -----------------------------------------------------------------------
+    # Temporal occupancy logic
+    # -----------------------------------------------------------------------
+
+    def update_seat_status(self, seat: Seat, overlap: float):
+        """Update seat status using area-overlap + temporal logic.
+        
+        Rules:
+        - Occupancy Confirmation: overlap >= threshold must be sustained for
+          `occupancy_confirmation_seconds` before flipping Empty → Occupied.
+        - Vacancy Grace Period: when overlap drops below threshold, a timer starts.
+          Seat stays Occupied for `vacancy_grace_period_minutes`. If overlap returns
+          above threshold during grace, the timer is cancelled.
+        - Testing Mode: all timers bypassed; status changes instantly.
+        """
+        threshold = self.config.occupancy_overlap_threshold
+        now = datetime.now()
+        testing = self.config.testing_mode
+
+        # Store the current overlap on the seat for frontend display
+        seat.overlap_percentage = overlap
+
+        is_covered = overlap >= threshold
+
+        if seat.status == "Empty":
+            if is_covered:
+                if testing:
+                    # Instant flip in testing mode
+                    seat.status = "Occupied"
+                    seat.last_empty_time = None
+                    seat.is_actionable = False
+                    seat.vacancy_timer_start = None
+                    self._seat_first_overlap_time[seat.id] = None
+                else:
+                    # Start or continue confirmation timer
+                    if self._seat_first_overlap_time.get(seat.id) is None:
+                        self._seat_first_overlap_time[seat.id] = now
+                    
+                    elapsed = (now - self._seat_first_overlap_time[seat.id]).total_seconds()
+                    if elapsed >= self.config.occupancy_confirmation_seconds:
+                        # Confirmed occupied
+                        seat.status = "Occupied"
+                        seat.last_empty_time = None
+                        seat.is_actionable = False
+                        seat.vacancy_timer_start = None
+                        self._seat_first_overlap_time[seat.id] = None
+            else:
+                # Not covered — reset confirmation timer
+                self._seat_first_overlap_time[seat.id] = None
+
+        elif seat.status == "Occupied":
+            if is_covered:
+                # Still occupied — cancel any pending vacancy timer
+                seat.vacancy_timer_start = None
+                self._seat_first_overlap_time[seat.id] = None
+            else:
+                if testing:
+                    # Instant flip in testing mode
+                    seat.status = "Empty"
+                    seat.last_empty_time = now
+                    seat.is_actionable = False
+                    seat.vacancy_timer_start = None
+                    self._seat_first_overlap_time[seat.id] = None
+                else:
+                    # Start or continue vacancy grace period
+                    if seat.vacancy_timer_start is None:
+                        seat.vacancy_timer_start = now
+                    
+                    elapsed_minutes = (now - seat.vacancy_timer_start).total_seconds() / 60.0
+                    if elapsed_minutes >= self.config.vacancy_grace_period_minutes:
+                        # Grace period expired — mark as Empty
+                        seat.status = "Empty"
+                        seat.last_empty_time = now
+                        seat.is_actionable = False
+                        seat.vacancy_timer_start = None
+                        self._seat_first_overlap_time[seat.id] = None
+
+    def update_actionable_flags(self):
+        """Update actionable flags based on empty duration thresholds."""
+        current_time = datetime.now()
+        
+        for zone_name, zone in self.zones.items():
+            threshold_minutes = zone.empty_threshold_minutes
+            
+            for seat in zone.seats:
+                # Only mark as actionable if seat was previously occupied and is now empty
+                if seat.status == "Empty" and seat.last_empty_time is not None:
+                    empty_duration = (current_time - seat.last_empty_time).total_seconds() / 60
+                    seat.is_actionable = empty_duration >= threshold_minutes
+                else:
+                    seat.is_actionable = False
 
     def detect_persons(self, frame) -> List[Tuple[int, int, int, int]]:
         """
@@ -282,93 +426,10 @@ class VisionEngine:
 
         return person_detections
     
-    def check_seat_occupancy(self, person_detections: List[Tuple[int, int, int, int]], 
-                            seat: Seat) -> bool:
-        """
-        Check if a seat is occupied based on person detections (bounding box overlap with seat circle).
-        """
-        radius = self.config.seat_detection_radius_pixels
-        for x1, y1, x2, y2 in person_detections:
-            if self._box_overlaps_circle(x1, y1, x2, y2, seat.x, seat.y, radius):
-                return True
-        return False
-    
-    def _update_seat_with_hysteresis(self, seat: Seat, is_occupied: bool):
-        """
-        Update seat using a per-seat score; switch Empty<->Occupied only at config thresholds.
-        Reduces flicker when a person is on the seat boundary.
-        """
-        score = self._seat_scores.get(seat.id, 0)
-        if is_occupied:
-            score = min(5, score + 1)
-        else:
-            score = max(-5, score - 1)
-        self._seat_scores[seat.id] = score
+    # -----------------------------------------------------------------------
+    # Thread-safe accessors
+    # -----------------------------------------------------------------------
 
-        occ_th = getattr(self.config, "hysteresis_occupied_threshold", 3)
-        empty_th = getattr(self.config, "hysteresis_empty_threshold", -3)
-
-        if seat.status == "Empty" and score >= occ_th:
-            seat.status = "Occupied"
-            seat.last_empty_time = None
-            seat.is_actionable = False
-        elif seat.status == "Occupied" and score <= empty_th:
-            seat.status = "Empty"
-            seat.last_empty_time = datetime.now()
-            seat.is_actionable = False
-
-    def update_seat_status(self, seat: Seat, is_occupied: bool):
-        """
-        Update seat status with stability counter logic.
-        
-        Args:
-            seat: Seat object to update
-            is_occupied: Current detection result
-        """
-        if getattr(self.config, "use_hysteresis", False):
-            self._update_seat_with_hysteresis(seat, is_occupied)
-            return
-
-        current_status = "Occupied" if is_occupied else "Empty"
-        expected_status = seat.status
-        
-        if current_status == expected_status:
-            # Detection matches current status, increment counter
-            seat.stability_counter += 1
-        else:
-            # Detection differs, start counting from 1 for the new state
-            seat.stability_counter = 1
-        
-        # Only update status if stability threshold is reached
-        if seat.stability_counter >= self.config.stability_required_scans:
-            if seat.status != current_status:
-                seat.status = current_status
-                
-                # Update time tracking
-                if current_status == "Empty":
-                    seat.last_empty_time = datetime.now()
-                    seat.is_actionable = False
-                else:
-                    seat.last_empty_time = None
-                    seat.is_actionable = False
-    
-    def update_actionable_flags(self):
-        """Update actionable flags based on empty duration thresholds."""
-        current_time = datetime.now()
-        
-        for zone_name, zone in self.zones.items():
-            threshold_minutes = zone.empty_threshold_minutes
-            
-            for seat in zone.seats:
-                # Only mark as actionable if seat was previously occupied and is now empty
-                # Seats that have been empty since initialization should not be actionable
-                if seat.status == "Empty" and seat.last_empty_time is not None:
-                    empty_duration = (current_time - seat.last_empty_time).total_seconds() / 60
-                    seat.is_actionable = empty_duration >= threshold_minutes
-                else:
-                    # Reset actionable flag if seat is occupied or never was occupied
-                    seat.is_actionable = False
-    
     def get_all_seats(self) -> Dict[str, Seat]:
         """Get a copy of all seat states (thread-safe)."""
         with self.lock:
@@ -378,7 +439,11 @@ class VisionEngine:
         """Get a copy of all zones (thread-safe)."""
         with self.lock:
             return {zone_name: Zone(**zone.model_dump()) for zone_name, zone in self.zones.items()}
-    
+
+    # -----------------------------------------------------------------------
+    # Camera management
+    # -----------------------------------------------------------------------
+
     def _open_webcam(self):
         """Try to open webcam or video file; on Windows use DirectShow first, then try indices 0, 1, 2."""
         import sys
@@ -426,6 +491,10 @@ class VisionEngine:
         
         return False
 
+    # -----------------------------------------------------------------------
+    # Main detection loop
+    # -----------------------------------------------------------------------
+
     def main_detection_loop(self):
         """Main detection loop running in a separate thread."""
         logger.info("Starting vision engine detection loop...")
@@ -472,14 +541,14 @@ class VisionEngine:
                         # Check if frame is valid (not black/closed camera)
                         if not self._is_frame_valid(detection_frame):
                             # Frame is too dark/invalid - mark all seats as Empty
-                            # Only update last_empty_time if seat was previously occupied
                             for seat in self.seats.values():
                                 was_occupied = seat.status == "Occupied"
                                 seat.status = "Empty"
-                                seat.stability_counter = self.config.stability_required_scans
+                                seat.overlap_percentage = 0.0
+                                seat.vacancy_timer_start = None
+                                self._seat_first_overlap_time[seat.id] = None
                                 if was_occupied:
                                     seat.last_empty_time = datetime.now()
-                                # Don't set last_empty_time if seat was already empty
                                 seat.is_actionable = False
                             logger.warning("Frame invalid (too dark) - all seats marked Empty")
                         else:
@@ -490,49 +559,30 @@ class VisionEngine:
                             skip_yolo = (not has_motion) and (time_since_forced < force_interval)
                             if skip_yolo:
                                 logger.debug("No motion; skipping YOLO (keeping previous seat state)")
+                                # Even when skipping, we still need to progress temporal timers
+                                for seat in self.seats.values():
+                                    last_overlap = self._seat_last_overlap.get(seat.id, 0.0)
+                                    self.update_seat_status(seat, last_overlap)
                             else:
                                 person_detections = self.detect_persons(detection_frame)
                                 # Store detections for overlay drawing
                                 self._last_person_detections = person_detections
-                                radius = self.config.seat_detection_radius_pixels
                                 debug = getattr(self.config, 'debug_detection', False)
                                 if debug:
                                     logger.debug(f"Detected {len(person_detections)} persons")
                                 
-                                # One-to-one assignment: each detection -> at most one seat (closest);
-                                # each seat -> at most one detection. Prevents one person marking multiple seats.
-                                seat_occupancy = {seat.id: False for seat in self.seats.values()}
-                                matches = []
-                                for det_idx, (x1, y1, x2, y2) in enumerate(person_detections):
-                                    for seat in self.seats.values():
-                                        if self._box_overlaps_circle(x1, y1, x2, y2, seat.x, seat.y, radius):
-                                            dist = self._distance_box_to_point(x1, y1, x2, y2, seat.x, seat.y)
-                                            matches.append((dist, det_idx, seat.id))
-                                matches.sort(key=lambda x: x[0])
-                                used_detections = set()
-                                assigned_seats = set()
-                                for dist, det_idx, seat_id in matches:
-                                    if det_idx in used_detections or seat_id in assigned_seats:
-                                        continue
-                                    seat_occupancy[seat_id] = True
-                                    used_detections.add(det_idx)
-                                    assigned_seats.add(seat_id)
-                                    if debug:
-                                        logger.debug(f"Assigned detection {det_idx} to seat {seat_id} (distance: {dist:.1f}px)")
-                                
-                                # Update seat statuses based on assignment
+                                # Compute cumulative overlap for each seat and update status
                                 for seat in self.seats.values():
-                                    is_occupied = seat_occupancy.get(seat.id, False)
-                                    self.update_seat_status(seat, is_occupied)
-                                
-                                if debug:
-                                    occupied_ids = [sid for sid, occ in seat_occupancy.items() if occ]
-                                    logger.debug(f"Seats marked occupied: {occupied_ids}")
-                                    logger.debug(f"Total person detections: {len(person_detections)}")
-                                    if person_detections:
-                                        logger.debug(f"Person bounding boxes: {person_detections}")
-                                    for seat in self.seats.values():
-                                        logger.debug(f"Seat {seat.id}: status={seat.status}, stability={seat.stability_counter}, occupied={seat_occupancy.get(seat.id, False)}")
+                                    overlap = self.compute_seat_overlap(seat, person_detections)
+                                    self._seat_last_overlap[seat.id] = overlap
+                                    self.update_seat_status(seat, overlap)
+                                    
+                                    if debug:
+                                        logger.debug(
+                                            f"Seat {seat.id}: overlap={overlap:.2%}, "
+                                            f"status={seat.status}, "
+                                            f"vacancy_timer={'active' if seat.vacancy_timer_start else 'none'}"
+                                        )
                                 
                                 # Update actionable flags
                                 self.update_actionable_flags()
@@ -552,10 +602,13 @@ class VisionEngine:
             logger.info("Detection loop interrupted")
         finally:
             self.cleanup()
-    
+
+    # -----------------------------------------------------------------------
+    # Visualization
+    # -----------------------------------------------------------------------
+
     def _draw_seat_overlay(self, img, person_detections: List[Tuple[int, int, int, int]] = None):
-        """Draw seat circles and labels on image (mutates img)."""
-        radius = self.config.seat_detection_radius_pixels
+        """Draw seat rectangles and labels on image (mutates img)."""
         debug = getattr(self.config, 'debug_detection', False)
         
         # Draw person detections if debug mode enabled
@@ -567,18 +620,28 @@ class VisionEngine:
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 cv2.circle(img, (cx, cy), 5, (255, 255, 0), -1)
         
-        # Draw seats
+        # Draw seats as rectangles
         for seat in self.seats.values():
-            x, y = seat.x, seat.y
-            # Green = Empty, Red = Occupied (seat taken)
-            color = (0, 255, 0) if seat.status == "Empty" else (0, 0, 255)
+            sx1, sy1 = seat.x, seat.y
+            sx2, sy2 = seat.x + seat.width, seat.y + seat.height
+            
+            # Color scheme: Red = Occupied, Grey = Unoccupied, Orange = Actionable
             if seat.is_actionable:
-                color = (0, 165, 255)  # orange
-            cv2.circle(img, (x, y), radius, color, 2)
-            cv2.putText(img, seat.id, (x - 20, y - radius - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                color = (0, 165, 255)  # Orange (BGR)
+            elif seat.status == "Occupied":
+                color = (0, 0, 255)  # Red (BGR)
+            else:
+                color = (150, 150, 150)  # Grey (BGR)
+            
+            cv2.rectangle(img, (sx1, sy1), (sx2, sy2), color, 2)
+            
+            # Label: seat id + overlap %
+            overlap_pct = int(seat.overlap_percentage * 100)
+            label = f"{seat.id} ({overlap_pct}%)"
+            cv2.putText(img, label, (sx1, sy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
     def get_debug_frame_png(self) -> bytes | None:
-        """Return a PNG image of the last camera frame with seat circles and labels drawn (for testing)."""
+        """Return a PNG image of the last camera frame with seat rectangles and labels drawn (for testing)."""
         with self.lock:
             if self._last_frame is None:
                 return None
@@ -615,6 +678,18 @@ class VisionEngine:
             self.cap.release()
         cv2.destroyAllWindows()
         logger.info("Vision engine cleaned up")
+
+    # -----------------------------------------------------------------------
+    # Runtime config update
+    # -----------------------------------------------------------------------
+
+    def update_config(self, **kwargs):
+        """Update config parameters at runtime (thread-safe)."""
+        with self.lock:
+            for key, value in kwargs.items():
+                if value is not None and hasattr(self.config, key):
+                    setattr(self.config, key, value)
+                    logger.info(f"Config updated: {key} = {value}")
 
 
 def start_vision_engine(seating_map_path: str, config_path: str) -> VisionEngine:

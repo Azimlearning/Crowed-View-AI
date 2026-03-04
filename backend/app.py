@@ -18,7 +18,7 @@ from typing import List
 
 from models import (
     SeatStatusResponse, ZoneStatsResponse, SuggestionRequest, SuggestionResponse,
-    Seat, Zone
+    ConfigUpdateRequest, Seat, Zone
 )
 from vision_engine import VisionEngine
 from logger_config import setup_logging, get_logger
@@ -83,7 +83,7 @@ async def root():
 
 @app.get("/api/debug-seat-map", response_class=Response)
 async def debug_seat_map():
-    """Return a snapshot of the camera with seat circles drawn (for testing camera and seat positions)."""
+    """Return a snapshot of the camera with seat rectangles drawn (for testing camera and seat positions)."""
     if not vision_engine:
         raise HTTPException(status_code=503, detail="Vision engine not initialized")
     png = vision_engine.get_debug_frame_png()
@@ -104,10 +104,11 @@ async def debug_detection_status():
             "id": seat.id,
             "zone": seat.zone,
             "status": seat.status,
-            "stability_counter": seat.stability_counter,
+            "overlap_percentage": round(seat.overlap_percentage, 4),
+            "vacancy_timer_start": str(seat.vacancy_timer_start) if seat.vacancy_timer_start else None,
             "is_actionable": seat.is_actionable,
             "last_empty_time": str(seat.last_empty_time) if seat.last_empty_time else None,
-            "position": {"x": seat.x, "y": seat.y}
+            "position": {"x": seat.x, "y": seat.y, "width": seat.width, "height": seat.height}
         })
     
     return {
@@ -115,8 +116,10 @@ async def debug_detection_status():
         "last_person_detections": vision_engine._last_person_detections if hasattr(vision_engine, '_last_person_detections') else None,
         "config": {
             "detection_interval_seconds": vision_engine.config.detection_interval_seconds,
-            "stability_required_scans": vision_engine.config.stability_required_scans,
-            "seat_detection_radius_pixels": vision_engine.config.seat_detection_radius_pixels,
+            "occupancy_overlap_threshold": vision_engine.config.occupancy_overlap_threshold,
+            "occupancy_confirmation_seconds": vision_engine.config.occupancy_confirmation_seconds,
+            "vacancy_grace_period_minutes": vision_engine.config.vacancy_grace_period_minutes,
+            "testing_mode": vision_engine.config.testing_mode,
             "person_detection_confidence_threshold": vision_engine.config.person_detection_confidence_threshold,
             "debug_detection": getattr(vision_engine.config, 'debug_detection', False)
         }
@@ -285,6 +288,48 @@ async def websocket_seats(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}", exc_info=True)
         if websocket in websocket_connections:
             websocket_connections.remove(websocket)
+
+
+@app.post("/api/config")
+async def update_config(request: ConfigUpdateRequest):
+    """Update runtime configuration (overlap threshold, timers, testing mode)."""
+    if not vision_engine:
+        raise HTTPException(status_code=503, detail="Vision engine not initialized")
+    
+    updates = request.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No configuration values provided")
+    
+    vision_engine.update_config(**updates)
+    
+    return {
+        "message": "Configuration updated",
+        "updated_fields": list(updates.keys()),
+        "current_config": {
+            "occupancy_overlap_threshold": vision_engine.config.occupancy_overlap_threshold,
+            "occupancy_confirmation_seconds": vision_engine.config.occupancy_confirmation_seconds,
+            "vacancy_grace_period_minutes": vision_engine.config.vacancy_grace_period_minutes,
+            "testing_mode": vision_engine.config.testing_mode,
+            "detection_interval_seconds": vision_engine.config.detection_interval_seconds,
+        }
+    }
+
+
+@app.get("/api/config")
+async def get_config():
+    """Get current runtime configuration."""
+    if not vision_engine:
+        raise HTTPException(status_code=503, detail="Vision engine not initialized")
+    
+    return {
+        "occupancy_overlap_threshold": vision_engine.config.occupancy_overlap_threshold,
+        "occupancy_confirmation_seconds": vision_engine.config.occupancy_confirmation_seconds,
+        "vacancy_grace_period_minutes": vision_engine.config.vacancy_grace_period_minutes,
+        "testing_mode": vision_engine.config.testing_mode,
+        "detection_interval_seconds": vision_engine.config.detection_interval_seconds,
+        "person_detection_confidence_threshold": vision_engine.config.person_detection_confidence_threshold,
+        "debug_detection": vision_engine.config.debug_detection,
+    }
 
 
 @app.post("/api/suggestions", response_model=SuggestionResponse)

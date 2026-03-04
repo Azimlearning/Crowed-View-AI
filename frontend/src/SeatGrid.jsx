@@ -17,23 +17,30 @@ const SeatGrid = ({ seats, onSeatClick }) => {
     if (seat.is_actionable) {
       return '#ff9800'; // Orange for actionable
     }
-    // Green = Empty, Red = Occupied (seat taken)
-    return seat.status === 'Empty' ? '#4caf50' : '#f44336';
+    // Red = Occupied, Grey = Unoccupied
+    return seat.status === 'Occupied' ? '#f44336' : '#9e9e9e';
   };
 
   const getSeatIcon = (seat) => {
     if (seat.is_actionable) {
       return '⚠️';
     }
-    return seat.status === 'Empty' ? '🟢' : '🔴';
+    return seat.status === 'Occupied' ? '🔴' : '⬜';
   };
 
   const formatTooltip = (seat) => {
+    const overlapPct = seat.overlap_percentage != null
+      ? (seat.overlap_percentage * 100).toFixed(1)
+      : '0.0';
     const parts = [
       `Seat: ${seat.id}`,
       `Status: ${seat.status}`,
-      `Zone: ${seat.zone}`
+      `Zone: ${seat.zone}`,
+      `Overlap: ${overlapPct}%`
     ];
+    if (seat.vacancy_timer_start) {
+      parts.push('Grace period active');
+    }
     if (seat.is_actionable && seat.last_empty_time) {
       const emptyDuration = Math.floor((new Date() - new Date(seat.last_empty_time)) / 60000);
       parts.push(`Empty for: ${emptyDuration} minutes`);
@@ -84,6 +91,11 @@ const SeatGrid = ({ seats, onSeatClick }) => {
                 <span className="seat-id" style={{ fontSize: '12px', textAlign: 'center' }}>
                   {seat.id}
                 </span>
+                <span style={{ fontSize: '10px', opacity: 0.9, marginTop: '2px' }}>
+                  {seat.overlap_percentage != null
+                    ? `${(seat.overlap_percentage * 100).toFixed(0)}%`
+                    : '0%'}
+                </span>
                 {seat.is_actionable && (
                   <span className="actionable-badge" style={{
                     position: 'absolute',
@@ -101,6 +113,17 @@ const SeatGrid = ({ seats, onSeatClick }) => {
                     fontWeight: 'bold'
                   }}>
                     !
+                  </span>
+                )}
+                {seat.vacancy_timer_start && seat.status === 'Occupied' && (
+                  <span style={{
+                    position: 'absolute',
+                    bottom: '4px',
+                    right: '4px',
+                    fontSize: '10px',
+                    opacity: 0.8
+                  }}>
+                    ⏳
                   </span>
                 )}
               </div>
