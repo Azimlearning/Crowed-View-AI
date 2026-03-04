@@ -36,9 +36,12 @@
 }
 
 @keyframes pulse {
-  0%, 100% {
+
+  0%,
+  100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.5;
   }
@@ -71,8 +74,13 @@
 }
 
 @keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
 }
 
 .dashboard-content {
@@ -82,6 +90,19 @@
   padding: 2rem;
   max-width: 1600px;
   margin: 0 auto;
+}
+
+.dashboard-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.dashboard-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  min-width: 0;
 }
 
 .zones-summary {
@@ -165,7 +186,7 @@
 
 .camera-stream {
   max-width: 100%;
-  max-height: 480px;
+  max-height: 720px;
   width: auto;
   height: auto;
   display: block;
@@ -297,9 +318,9 @@
   .dashboard-content {
     grid-template-columns: 1fr;
   }
-  
-  .live-camera-section {
-    order: -1; /* Show camera first on mobile */
+
+  .dashboard-main {
+    order: -1;
   }
 }
 
@@ -308,12 +329,12 @@
     padding: 1rem;
     gap: 1rem;
   }
-  
+
   .legend {
     gap: 1rem;
     padding: 0.75rem;
   }
-  
+
   .zone-stat-card {
     padding: 1rem;
   }

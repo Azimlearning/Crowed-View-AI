@@ -1,14 +1,24 @@
 ---
 name: saving-progress
-description: Saves the current project progress to the Git repository by securely checking for leaks, staging changes, writing a detailed commit message, and pushing to the main branch. Use when the user asks to save progress, commit changes, or update the repository.
+description: Saves the current project progress to the Git repository by securely checking for leaks, staging changes, writing a detailed commit message, and pushing to the main branch. ONLY invoke this skill when the user explicitly asks to save, commit, or push — NEVER auto-invoke during implementation.
 ---
 
 # Saving Project Progress
 
+<HARD-GATE>
+Do NOT invoke this skill automatically. Do NOT commit or push at the end of a task, after a feature implementation, or as a "cleanup" step.
+This skill runs ONLY when the user explicitly says one of:
+- "save my progress"
+- "commit this"
+- "push to GitHub"
+- Or a clearly equivalent explicit request.
+If the user has not said one of these, do NOT run this skill.
+</HARD-GATE>
+
 ## When to use this skill
-- The user asks to "save progress of my project".
-- The user wants to commit and push changes to GitHub.
-- The user has completed a feature or task and wants to back it up securely.
+- The user **explicitly** asks to "save progress", "commit changes", or "push to GitHub".
+- The user has reviewed the changes themselves and decided they are ready to commit.
+- **Never** invoke this automatically at the end of a plan, feature implementation, or verification step.
 
 ## Workflow
 - [ ] **1. Security Check**: Run a validation to ensure no API keys (e.g., Google Maps API keys, credentials), sensitive endpoints, or `.env` files are accidentally being committed. Look through unstaged changes using `git diff`.

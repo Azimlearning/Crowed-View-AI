@@ -383,9 +383,14 @@ async def get_suggestions(request: SuggestionRequest):
         
         prompt = (
             f"The event is a {event_type}. In the {request.zone_name} zone, "
-            f"{empty_percentage:.1f}% of seats have been empty for {avg_empty_duration:.1f} minutes. "
-            f"Provide 2-3 professional operational suggestions (e.g., reassigning guests or upgrading attendees). "
-            f"Format your response as a simple list, one suggestion per line."
+            f"{empty_percentage:.1f}% of seats are currently Empty. "
+            f"These seats have exceeded the {zone.empty_threshold_minutes}-minute vacancy threshold "
+            f"and have been empty for an average of {avg_empty_duration:.1f} minutes. "
+            f"Given our goal to maximize venue optics and recover lost ticketing revenue "
+            f"without moving physical furniture, provide 2-3 specific, actionable operational "
+            f"suggestions (e.g., offering seat upgrades to waiting list guests, moving back-row "
+            f"attendees forward, contacting VIP concierge). "
+            f"Format your response as a simple numbered list, one suggestion per line."
         )
         
         response = model.generate_content(prompt)
