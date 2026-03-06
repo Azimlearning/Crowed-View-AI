@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import SeatGrid from './SeatGrid';
+import CameraOverlay from './CameraOverlay';
 import { getSeats, getZones, getSuggestions, getConfig, updateConfig } from './api';
 import './Dashboard.css';
 
@@ -14,6 +15,7 @@ const Dashboard = () => {
   const [testingMode, setTestingMode] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [config, setConfig] = useState(null);
+  const [viewMode, setViewMode] = useState('camera'); // 'camera' or 'grid'
 
   const fetchData = async () => {
     try {
@@ -210,51 +212,34 @@ const Dashboard = () => {
             );
           })()}
 
-          <div className="live-camera-section">
-            <h2>Live camera</h2>
-            <div className="camera-stream-wrapper">
-              {streamError ? (
-                <div className="camera-stream-fallback">
-                  <p>Live feed unavailable.</p>
-                  <p>Check that the backend is running and the webcam is connected.</p>
-                  <button
-                    onClick={() => {
-                      setStreamError(false);
-                      setRetryCount(prev => prev + 1);
-                    }}
-                    style={{
-                      marginTop: '10px',
-                      padding: '8px 16px',
-                      backgroundColor: '#4caf50',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    Retry Connection
-                  </button>
-                </div>
-              ) : (
-                <img
-                  key={retryCount}
-                  src={`/api/camera-stream?t=${Date.now()}`}
-                  alt="Live webcam feed with seat overlay"
-                  className="camera-stream"
-                  onError={() => {
-                    console.error('Camera stream error');
-                    setStreamError(true);
-                  }}
-                  onLoad={() => {
-                    setStreamError(false);
-                  }}
-                />
-              )}
-            </div>
-          </div>
-
           <div className="seat-visualization">
-            <h2>Seat Map</h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h2>Seat Map</h2>
+              <div className="view-mode-toggle" style={{ display: 'flex', gap: '8px', backgroundColor: '#eee', padding: '4px', borderRadius: '6px' }}>
+                <button
+                  onClick={() => setViewMode('camera')}
+                  style={{
+                    padding: '6px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer',
+                    backgroundColor: viewMode === 'camera' ? '#2196f3' : 'transparent',
+                    color: viewMode === 'camera' ? 'white' : '#555',
+                    fontWeight: viewMode === 'camera' ? 'bold' : 'normal',
+                    transition: 'all 0.2s'
+                  }}>
+                  Live Camera
+                </button>
+                <button
+                  onClick={() => setViewMode('grid')}
+                  style={{
+                    padding: '6px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer',
+                    backgroundColor: viewMode === 'grid' ? '#2196f3' : 'transparent',
+                    color: viewMode === 'grid' ? 'white' : '#555',
+                    fontWeight: viewMode === 'grid' ? 'bold' : 'normal',
+                    transition: 'all 0.2s'
+                  }}>
+                  Abstract Grid
+                </button>
+              </div>
+            </div>
             <div className="legend">
               <div className="legend-item">
                 <div className="legend-color" style={{ backgroundColor: '#9e9e9e' }}></div>
@@ -269,7 +254,12 @@ const Dashboard = () => {
                 <span>Actionable (Click for suggestions)</span>
               </div>
             </div>
-            <SeatGrid seats={seats} onSeatClick={handleSeatClick} config={config} />
+
+            {viewMode === 'camera' ? (
+              <CameraOverlay seats={seats} onSeatClick={handleSeatClick} config={config} />
+            ) : (
+              <SeatGrid seats={seats} onSeatClick={handleSeatClick} config={config} />
+            )}
           </div>
         </div>
       </div>
@@ -281,14 +271,35 @@ const Dashboard = () => {
             <h2>AI Suggestions for {suggestions.zone_name}</h2>
             <div className="suggestion-stats">
               <p>
-                {suggestions.empty_percentage.toFixed(1)}% empty for{' '}
+                {suggestions.empty_percentage.toFixed(1)}% unoccupied for{' '}
                 {suggestions.empty_duration_minutes.toFixed(1)} minutes
               </p>
             </div>
             <ul className="suggestions-list">
-              {suggestions.suggestions.map((suggestion, index) => (
-                <li key={index}>{suggestion}</li>
-              ))}
+              {suggestions.suggestions.map((suggestion, index) => {
+                const energyMatch = suggestion.match(/^\[Energy\]/i);
+                const venueMatch = suggestion.match(/^\[Venue\]/i);
+                const text = suggestion.replace(/^\[(Energy|Venue)\]\s*/i, '');
+                return (
+                  <li key={index}>
+                    {energyMatch && (
+                      <span style={{
+                        display: 'inline-block', marginRight: '8px', padding: '2px 8px',
+                        backgroundColor: '#e8f5e9', color: '#2e7d32', borderRadius: '10px',
+                        fontSize: '11px', fontWeight: 'bold', verticalAlign: 'middle'
+                      }}>⚡ Energy</span>
+                    )}
+                    {venueMatch && (
+                      <span style={{
+                        display: 'inline-block', marginRight: '8px', padding: '2px 8px',
+                        backgroundColor: '#e3f2fd', color: '#1565c0', borderRadius: '10px',
+                        fontSize: '11px', fontWeight: 'bold', verticalAlign: 'middle'
+                      }}>🏛 Venue</span>
+                    )}
+                    {text}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         </div>
