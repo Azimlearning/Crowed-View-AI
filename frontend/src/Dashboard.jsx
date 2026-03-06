@@ -17,6 +17,7 @@ const Dashboard = () => {
   const [config, setConfig] = useState(null);
   const [viewMode, setViewMode] = useState('camera'); // 'camera' or 'grid'
   const [isEditingLayout, setIsEditingLayout] = useState(false);
+  const [editedSeats, setEditedSeats] = useState([]);
 
   const fetchData = async () => {
     try {
@@ -51,11 +52,89 @@ const Dashboard = () => {
   }, []);
 
   useEffect(() => {
+    if (isEditingLayout) return; // Pause polling while editing
     fetchData();
     // Poll every 5 seconds
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isEditingLayout]);
+
+  const handleEditToggle = () => {
+    if (!isEditingLayout) {
+      // Enter edit mode: copy current seats to editedSeats
+      setEditedSeats(JSON.parse(JSON.stringify(seats)));
+    }
+    setIsEditingLayout(!isEditingLayout);
+  };
+
+  const handleSaveLayout = async () => {
+    try {
+      setLoading(true);
+      const zoneMap = {};
+      zones.forEach(z => zoneMap[z.zone_name] = []);
+
+      editedSeats.forEach(seat => {
+        if (!zoneMap[seat.zone]) {
+          zoneMap[seat.zone] = [];
+        }
+        zoneMap[seat.zone].push({
+          id: seat.id,
+          x: Math.round(seat.x),
+          y: Math.round(seat.y),
+          width: Math.round(seat.width),
+          height: Math.round(seat.height)
+        });
+      });
+
+      const payload = {
+        zones: Object.keys(zoneMap).map(zoneName => ({
+          name: zoneName,
+          seats: zoneMap[zoneName]
+        }))
+      };
+
+      const response = await fetch('http://localhost:8000/api/seating-map', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) throw new Error('Failed to save layout');
+
+      setIsEditingLayout(false);
+      await fetchData(); // Refresh to get backend truth
+    } catch (err) {
+      console.error(err);
+      setError('Failed to save the new layout to the backend.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAddSeat = () => {
+    const defaultZone = zones.length > 0 ? zones[0].zone_name : "Default";
+    const generateId = () => `Seat-${Math.floor(Math.random() * 10000)}`;
+    const newSeat = {
+      id: generateId(),
+      x: 270,
+      y: 190,
+      width: 100,
+      height: 100,
+      zone: defaultZone,
+      status: "Empty",
+      is_actionable: false,
+      overlap_percentage: 0.0
+    };
+    setEditedSeats([...editedSeats, newSeat]);
+  };
+
+  const handleSeatUpdate = (updatedSeat) => {
+    setEditedSeats(prev => prev.map(s => s.id === updatedSeat.id ? updatedSeat : s));
+  };
+
+  const handleSeatDelete = (seatId) => {
+    setEditedSeats(prev => prev.filter(s => s.id !== seatId));
+  };
 
   const handleSeatClick = async (seat) => {
     if (!seat.is_actionable) return;
@@ -239,18 +318,42 @@ const Dashboard = () => {
                   }}>
                   Abstract Grid
                 </button>
-                {viewMode === 'grid' && (
+                <div style={{ width: '1px', backgroundColor: '#ccc', margin: '0 4px' }}></div>
+                {isEditingLayout && (
                   <button
-                    onClick={() => setIsEditingLayout(!isEditingLayout)}
+                    onClick={handleAddSeat}
                     style={{
-                      padding: '6px 16px', border: '1px solid #2196f3', borderRadius: '4px', cursor: 'pointer',
-                      backgroundColor: isEditingLayout ? '#e3f2fd' : 'transparent',
-                      color: '#2196f3',
+                      padding: '6px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer',
+                      backgroundColor: '#4caf50',
+                      color: 'white',
                       fontWeight: 'bold',
-                      transition: 'all 0.2s',
-                      marginLeft: '8px'
+                      transition: 'all 0.2s'
                     }}>
-                    {isEditingLayout ? 'Save Layout' : 'Edit Layout'}
+                    + Add Seat
+                  </button>
+                )}
+                <button
+                  onClick={isEditingLayout ? handleSaveLayout : handleEditToggle}
+                  style={{
+                    padding: '6px 16px', border: '1px solid #2196f3', borderRadius: '4px', cursor: 'pointer',
+                    backgroundColor: isEditingLayout ? '#e3f2fd' : 'transparent',
+                    color: '#2196f3',
+                    fontWeight: 'bold',
+                    transition: 'all 0.2s'
+                  }}>
+                  {isEditingLayout ? 'Save Layout' : 'Edit Layout'}
+                </button>
+                {isEditingLayout && (
+                  <button
+                    onClick={() => setIsEditingLayout(false)}
+                    style={{
+                      padding: '6px 16px', border: '1px solid #f44336', borderRadius: '4px', cursor: 'pointer',
+                      backgroundColor: 'transparent',
+                      color: '#f44336',
+                      fontWeight: 'bold',
+                      transition: 'all 0.2s'
+                    }}>
+                    Cancel
                   </button>
                 )}
               </div>
@@ -271,13 +374,22 @@ const Dashboard = () => {
             </div>
 
             {viewMode === 'camera' ? (
-              <CameraOverlay seats={seats} onSeatClick={handleSeatClick} config={config} />
-            ) : (
-              <SeatGrid
-                seats={seats}
+              <CameraOverlay
+                seats={isEditingLayout ? editedSeats : seats}
                 onSeatClick={handleSeatClick}
                 config={config}
                 isEditingLayout={isEditingLayout}
+                onSeatUpdate={handleSeatUpdate}
+                onSeatDelete={handleSeatDelete}
+              />
+            ) : (
+              <SeatGrid
+                seats={isEditingLayout ? editedSeats : seats}
+                onSeatClick={handleSeatClick}
+                config={config}
+                isEditingLayout={isEditingLayout}
+                onSeatUpdate={handleSeatUpdate}
+                onSeatDelete={handleSeatDelete}
               />
             )}
           </div>

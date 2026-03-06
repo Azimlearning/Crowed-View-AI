@@ -374,13 +374,17 @@ class VisionEngine:
     def update_actionable_flags(self):
         """Update actionable flags based on empty duration thresholds."""
         current_time = datetime.now()
+        testing = self.config.testing_mode
         
         for zone_name, zone in self.zones.items():
-            threshold_minutes = zone.empty_threshold_minutes
+            # In testing mode, bypass the threshold — any empty seat is instantly actionable
+            threshold_minutes = 0 if testing else zone.empty_threshold_minutes
             
             for seat in zone.seats:
-                # Only mark as actionable if seat was previously occupied and is now empty
-                if seat.status == "Empty" and seat.last_empty_time is not None:
+                if seat.status == "Empty":
+                    # Initialize last_empty_time for seats that started empty on boot
+                    if seat.last_empty_time is None:
+                        seat.last_empty_time = current_time
                     empty_duration = (current_time - seat.last_empty_time).total_seconds() / 60
                     seat.is_actionable = empty_duration >= threshold_minutes
                 else:
@@ -584,9 +588,10 @@ class VisionEngine:
                                             f"vacancy_timer={'active' if seat.vacancy_timer_start else 'none'}"
                                         )
                                 
-                                # Update actionable flags
-                                self.update_actionable_flags()
                                 self._last_forced_detection_time = current_time
+                            
+                            # Always update actionable flags — runs after both YOLO and no-motion paths
+                            self.update_actionable_flags()
                     
                     last_detection_time = current_time
                     logger.debug(f"Detection completed at {datetime.now().strftime('%H:%M:%S')}")
@@ -691,6 +696,18 @@ class VisionEngine:
                     setattr(self.config, key, value)
                     logger.info(f"Config updated: {key} = {value}")
 
+    def reload_seating_map(self):
+        """Reload the seating map from disk and recompute ROI (thread-safe)."""
+        with self.lock:
+            logger.info("Reloading seating map from disk...")
+            self.seats.clear()
+            self.zones.clear()
+            self._seat_first_overlap_time.clear()
+            self._seat_last_overlap.clear()
+            
+            self._load_seating_map()
+            self._compute_detection_roi()
+            logger.info(f"Loaded {len(self.seats)} seats across {len(self.zones)} zones.")
 
 def start_vision_engine(seating_map_path: str, config_path: str) -> VisionEngine:
     """Start the vision engine in a background thread."""

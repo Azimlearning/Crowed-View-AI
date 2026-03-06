@@ -34,13 +34,13 @@ _zone_stats_cache = {
     'ttl': 2.0  # Cache for 2 seconds
 }
 
-# Load environment variables
-load_dotenv()
-
 # Initialize paths
 BASE_DIR = Path(__file__).parent.parent
 SEATING_MAP_PATH = BASE_DIR / "data" / "seating_map.json"
 CONFIG_PATH = BASE_DIR / "data" / "config.json"
+
+# Load environment variables from project root
+load_dotenv(BASE_DIR / ".env")
 
 vision_engine: VisionEngine = None
 # WebSocket connections manager
@@ -289,6 +289,28 @@ async def websocket_seats(websocket: WebSocket):
         if websocket in websocket_connections:
             websocket_connections.remove(websocket)
 
+@app.post("/api/seating-map")
+async def update_seating_map(request: dict):
+    """Update seating map on disk and hot-reload vision engine."""
+    if not vision_engine:
+        raise HTTPException(status_code=503, detail="Vision engine not initialized")
+    
+    if "zones" not in request:
+        raise HTTPException(status_code=400, detail="Payload must contain 'zones'")
+        
+    try:
+        # Save to disk
+        with open(SEATING_MAP_PATH, 'w') as f:
+            json.dump(request, f, indent=2)
+            
+        # Hot-reload vision engine
+        vision_engine.reload_seating_map()
+        
+        return {"message": "Seating map updated successfully"}
+    except Exception as e:
+        logger.error(f"Error updating seating map: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/config")
 async def update_config(request: ConfigUpdateRequest):
@@ -382,15 +404,21 @@ async def get_suggestions(request: SuggestionRequest):
         model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = (
-            f"The event is a {event_type}. In the {request.zone_name} zone, "
-            f"{empty_percentage:.1f}% of seats are currently Empty. "
-            f"These seats have exceeded the {zone.empty_threshold_minutes}-minute vacancy threshold "
-            f"and have been empty for an average of {avg_empty_duration:.1f} minutes. "
-            f"Given our goal to maximize venue optics and recover lost ticketing revenue "
-            f"without moving physical furniture, provide 2-3 specific, actionable operational "
-            f"suggestions (e.g., offering seat upgrades to waiting list guests, moving back-row "
-            f"attendees forward, contacting VIP concierge). "
-            f"Format your response as a simple numbered list, one suggestion per line."
+            f"You are an AI assistant for a Smart Building Management system. "
+            f"The facility is a {event_type}. In the '{request.zone_name}' zone, "
+            f"{empty_percentage:.1f}% of seats are currently unoccupied. "
+            f"These seats have been empty for an average of {avg_empty_duration:.1f} minutes, "
+            f"exceeding the zone's {zone.empty_threshold_minutes}-minute vacancy threshold. "
+            f"\n\nProvide exactly 3 concise, actionable operational suggestions. "
+            f"Your suggestions MUST cover BOTH of these two areas:\n"
+            f"1. **Energy Sustainability**: Actions to reduce energy waste in the empty zone "
+            f"(e.g., adjusting HVAC load, dimming or switching off lighting in unoccupied sections, "
+            f"reducing cooling or heating to save electricity).\n"
+            f"2. **Smart Venue Management**: Actions to optimize space usage or redirect people "
+            f"(e.g., consolidating attendees into occupied sections, notifying staff to close off "
+            f"the empty area, or re-routing incoming visitors).\n\n"
+            f"Format your response as a simple numbered list (1., 2., 3.), one suggestion per line. "
+            f"Each suggestion must start with the category in brackets, e.g. [Energy] or [Venue]."
         )
         
         response = model.generate_content(prompt)

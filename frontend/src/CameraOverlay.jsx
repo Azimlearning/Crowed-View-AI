@@ -4,12 +4,15 @@ import './CameraOverlay.css';
 const NATIVE_WIDTH = 640;
 const NATIVE_HEIGHT = 480;
 
-const CameraOverlay = ({ seats = [], onSeatClick, config }) => {
+const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSeatUpdate, onSeatDelete }) => {
     const containerRef = useRef(null);
     const [scale, setScale] = useState({ x: 1, y: 1 });
     const [hoveredSeat, setHoveredSeat] = useState(null);
     const [streamError, setStreamError] = useState(false);
     const [retryCount, setRetryCount] = useState(0);
+
+    const [draggingSeat, setDraggingSeat] = useState(null);
+    const [resizingSeat, setResizingSeat] = useState(null);
 
     const overlapThreshold = config?.occupancy_overlap_threshold ?? 0.6;
     const gracePeriodMinutes = config?.vacancy_grace_period_minutes ?? 20;
@@ -42,6 +45,58 @@ const CameraOverlay = ({ seats = [], onSeatClick, config }) => {
 
         return () => observer.disconnect();
     }, []);
+
+    const handlePointerDown = (e, seat, isResize = false) => {
+        if (!isEditingLayout) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const startX = e.clientX;
+        const startY = e.clientY;
+
+        if (isResize) {
+            setResizingSeat({
+                id: seat.id,
+                startX, startY,
+                initialWidth: seat.width,
+                initialHeight: seat.height
+            });
+        } else {
+            setDraggingSeat({
+                id: seat.id,
+                startX, startY,
+                initialX: seat.x,
+                initialY: seat.y
+            });
+        }
+    };
+
+    const handlePointerMove = (e) => {
+        if (!isEditingLayout) return;
+
+        if (draggingSeat) {
+            const dx = (e.clientX - draggingSeat.startX) / scale.x;
+            const dy = (e.clientY - draggingSeat.startY) / scale.y;
+            onSeatUpdate({
+                ...seats.find(s => s.id === draggingSeat.id),
+                x: draggingSeat.initialX + dx,
+                y: draggingSeat.initialY + dy
+            });
+        } else if (resizingSeat) {
+            const dx = (e.clientX - resizingSeat.startX) / scale.x;
+            const dy = (e.clientY - resizingSeat.startY) / scale.y;
+            onSeatUpdate({
+                ...seats.find(s => s.id === resizingSeat.id),
+                width: Math.max(20, resizingSeat.initialWidth + dx),
+                height: Math.max(20, resizingSeat.initialHeight + dy)
+            });
+        }
+    };
+
+    const handlePointerUp = () => {
+        if (draggingSeat) setDraggingSeat(null);
+        if (resizingSeat) setResizingSeat(null);
+    };
 
     const getGraceCountdown = (seat) => {
         if (!seat.vacancy_timer_start || seat.status !== 'Occupied') return null;
@@ -111,7 +166,13 @@ const CameraOverlay = ({ seats = [], onSeatClick, config }) => {
                     </button>
                 </div>
             ) : (
-                <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
+                <div
+                    ref={containerRef}
+                    style={{ position: 'relative', width: '100%', touchAction: isEditingLayout ? 'none' : 'auto', overflow: 'hidden' }}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerLeave={handlePointerUp}
+                >
                     <img
                         key={retryCount}
                         src={`/api/camera-stream?t=${Date.now()}`}
@@ -132,7 +193,12 @@ const CameraOverlay = ({ seats = [], onSeatClick, config }) => {
                             left: `${seat.x * scale.x}px`,
                             top: `${seat.y * scale.y}px`,
                             width: `${seat.width * scale.x}px`,
-                            height: `${seat.height * scale.y}px`
+                            height: `${seat.height * scale.y}px`,
+                            zIndex: (draggingSeat?.id === seat.id || resizingSeat?.id === seat.id) ? 100 : 1,
+                            cursor: isEditingLayout ? (draggingSeat?.id === seat.id ? 'grabbing' : 'grab') : (seat.is_actionable ? 'pointer' : 'default'),
+                            border: isEditingLayout ? '2px dashed #2196f3' : undefined,
+                            boxShadow: isEditingLayout ? '0 0 10px rgba(33, 150, 243, 0.5)' : undefined,
+                            backgroundColor: isEditingLayout ? 'rgba(33, 150, 243, 0.2)' : undefined,
                         };
 
                         return (
@@ -140,11 +206,29 @@ const CameraOverlay = ({ seats = [], onSeatClick, config }) => {
                                 key={seat.id}
                                 className={getSeatClasses(seat)}
                                 style={style}
-                                data-tooltip={formatTooltip(seat)}
+                                data-tooltip={isEditingLayout ? 'Drag to move, bottom-right to resize' : formatTooltip(seat)}
                                 onMouseEnter={() => setHoveredSeat(seat.id)}
                                 onMouseLeave={() => setHoveredSeat(null)}
-                                onClick={() => seat.is_actionable && onSeatClick && onSeatClick(seat)}
+                                onClick={() => !isEditingLayout && seat.is_actionable && onSeatClick && onSeatClick(seat)}
+                                onPointerDown={(e) => handlePointerDown(e, seat, false)}
                             >
+                                {isEditingLayout && (
+                                    <>
+                                        <div
+                                            onClick={(e) => { e.stopPropagation(); onSeatDelete(seat.id); }}
+                                            style={{ position: 'absolute', top: -10, right: -10, background: '#f44336', color: 'white', borderRadius: '50%', width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', zIndex: 101, fontSize: '14px', fontWeight: 'bold', boxShadow: '0 2px 4px rgba(0,0,0,0.3)' }}
+                                            title="Delete Seat"
+                                        >
+                                            ×
+                                        </div>
+                                        <div
+                                            onPointerDown={(e) => handlePointerDown(e, seat, true)}
+                                            style={{ position: 'absolute', bottom: -6, right: -6, width: 16, height: 16, background: '#2196f3', cursor: 'nwse-resize', borderRadius: '50%', zIndex: 101, boxShadow: '0 2px 4px rgba(0,0,0,0.3)', border: '2px solid white' }}
+                                            title="Resize Seat"
+                                        />
+                                    </>
+                                )}
+
                                 {/* Small inner indicator for ID or countdown */}
                                 <div className="overlay-seat-indicator">
                                     {countdown ? countdown : seat.id}
