@@ -16,6 +16,7 @@ const Dashboard = () => {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [config, setConfig] = useState(null);
   const [viewMode, setViewMode] = useState('camera'); // 'camera' or 'grid'
+  const [isEditingLayout, setIsEditingLayout] = useState(false);
 
   const fetchData = async () => {
     try {
@@ -238,6 +239,20 @@ const Dashboard = () => {
                   }}>
                   Abstract Grid
                 </button>
+                {viewMode === 'grid' && (
+                  <button
+                    onClick={() => setIsEditingLayout(!isEditingLayout)}
+                    style={{
+                      padding: '6px 16px', border: '1px solid #2196f3', borderRadius: '4px', cursor: 'pointer',
+                      backgroundColor: isEditingLayout ? '#e3f2fd' : 'transparent',
+                      color: '#2196f3',
+                      fontWeight: 'bold',
+                      transition: 'all 0.2s',
+                      marginLeft: '8px'
+                    }}>
+                    {isEditingLayout ? 'Save Layout' : 'Edit Layout'}
+                  </button>
+                )}
               </div>
             </div>
             <div className="legend">
@@ -258,7 +273,12 @@ const Dashboard = () => {
             {viewMode === 'camera' ? (
               <CameraOverlay seats={seats} onSeatClick={handleSeatClick} config={config} />
             ) : (
-              <SeatGrid seats={seats} onSeatClick={handleSeatClick} config={config} />
+              <SeatGrid
+                seats={seats}
+                onSeatClick={handleSeatClick}
+                config={config}
+                isEditingLayout={isEditingLayout}
+              />
             )}
           </div>
         </div>

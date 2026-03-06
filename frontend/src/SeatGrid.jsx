@@ -1,8 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import './SeatGrid.css';
 
-const SeatGrid = ({ seats, onSeatClick, config }) => {
+const SeatGrid = ({ seats, onSeatClick, config, isEditingLayout }) => {
   const [hoveredSeat, setHoveredSeat] = useState(null);
+  const [layout, setLayout] = useState({});
+  const [draggingSeat, setDraggingSeat] = useState(null);
+
+  const gridRef = useRef(null);
 
   const overlapThreshold = config?.occupancy_overlap_threshold ?? 0.6;
   const gracePeriodMinutes = config?.vacancy_grace_period_minutes ?? 20;
@@ -16,6 +20,71 @@ const SeatGrid = ({ seats, onSeatClick, config }) => {
     }
     seatsByZone[seat.zone].push(seat);
   });
+
+  // Load layout from local storage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('crowdview_layout_v1');
+      if (saved) {
+        setLayout(JSON.parse(saved));
+      }
+    } catch (e) {
+      console.error('Error loading layout', e);
+    }
+  }, []);
+
+  // Pointer events for drag and drop
+  const handlePointerDown = (e, seatId) => {
+    if (!isEditingLayout) return;
+
+    // Prevent default to avoid selection issues while dragging
+    e.preventDefault();
+
+    // Store starting position of the pointer and the current seat position
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    // Get current position or default to 0,0
+    const currentPos = layout[seatId] || { x: 0, y: 0 };
+
+    setDraggingSeat({
+      id: seatId,
+      startX,
+      startY,
+      initialX: currentPos.x,
+      initialY: currentPos.y
+    });
+  };
+
+  const handlePointerMove = (e) => {
+    if (!isEditingLayout || !draggingSeat) return;
+
+    const dx = e.clientX - draggingSeat.startX;
+    const dy = e.clientY - draggingSeat.startY;
+
+    // Optional: add grid snapping by rounding dx/dy here
+
+    setLayout(prev => ({
+      ...prev,
+      [draggingSeat.id]: {
+        x: draggingSeat.initialX + dx,
+        y: draggingSeat.initialY + dy
+      }
+    }));
+  };
+
+  const handlePointerUp = () => {
+    if (!draggingSeat) return;
+
+    // Save to local storage
+    try {
+      localStorage.setItem('crowdview_layout_v1', JSON.stringify(layout));
+    } catch (e) {
+      console.error('Error saving layout', e);
+    }
+
+    setDraggingSeat(null);
+  };
 
   const getSeatColor = (seat) => {
     if (seat.is_actionable) return '#ff9800'; // Orange
@@ -92,13 +161,18 @@ const SeatGrid = ({ seats, onSeatClick, config }) => {
       {Object.entries(seatsByZone).map(([zoneName, zoneSeats]) => (
         <div key={zoneName} className="zone-section">
           <h2 className="zone-title">{zoneName} Zone ({zoneSeats.length} seats)</h2>
-          <div className="seat-grid" style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
-            gap: '12px',
-            padding: '16px'
-          }}>
-            {zoneSeats.map(seat => {
+          <div
+            className="seat-grid"
+            ref={gridRef}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerLeave={handlePointerUp}
+            style={{
+              position: 'relative',
+              minHeight: '600px', // Ensure enough space for absolute positioning
+              touchAction: 'none' // Prevent scrolling while dragging on touch devices
+            }}>
+            {zoneSeats.map((seat, index) => {
               const countdown = getGraceCountdown(seat);
               const confirmProg = getConfirmationProgress(seat);
               const aspectRatio = getSeatAspectRatio(seat);
@@ -109,25 +183,31 @@ const SeatGrid = ({ seats, onSeatClick, config }) => {
                   className={getSeatClasses(seat)}
                   style={{
                     backgroundColor: getSeatColor(seat),
-                    cursor: seat.is_actionable ? 'pointer' : 'default',
-                    position: 'relative',
+                    cursor: isEditingLayout ? (draggingSeat?.id === seat.id ? 'grabbing' : 'grab') : (seat.is_actionable ? 'pointer' : 'default'),
+                    position: 'absolute',
+                    // If we have a saved layout, use it. Otherwise, generate a default grid fallback.
+                    left: layout[seat.id] ? `${layout[seat.id].x}px` : `${(index % 8) * 130 + 16}px`,
+                    top: layout[seat.id] ? `${layout[seat.id].y}px` : `${Math.floor(index / 8) * 130 + 16}px`,
+                    width: '120px',
+                    height: '120px',
                     padding: '12px',
                     borderRadius: '8px',
-                    boxShadow: hoveredSeat === seat.id ? '0 4px 8px rgba(0,0,0,0.3)' : '0 2px 4px rgba(0,0,0,0.2)',
-                    transition: 'all 0.2s ease',
-                    minHeight: '80px',
-                    aspectRatio: `${aspectRatio}`,
+                    boxShadow: (hoveredSeat === seat.id || draggingSeat?.id === seat.id) ? '0 4px 16px rgba(0,0,0,0.4)' : '0 2px 4px rgba(0,0,0,0.2)',
+                    transition: draggingSeat?.id === seat.id ? 'none' : 'box-shadow 0.2s, background-color 0.2s', // Disable position transition while dragging
                     display: 'flex',
                     flexDirection: 'column',
                     alignItems: 'center',
                     justifyContent: 'center',
                     color: 'white',
-                    fontWeight: 'bold'
+                    fontWeight: 'bold',
+                    zIndex: draggingSeat?.id === seat.id ? 100 : (hoveredSeat === seat.id ? 50 : 1),
+                    userSelect: 'none' // Prevent text selection during drag
                   }}
-                  title={formatTooltip(seat)}
+                  title={isEditingLayout ? 'Drag to reposition' : formatTooltip(seat)}
                   onMouseEnter={() => setHoveredSeat(seat.id)}
                   onMouseLeave={() => setHoveredSeat(null)}
-                  onClick={() => seat.is_actionable && onSeatClick && onSeatClick(seat)}
+                  onClick={() => !isEditingLayout && seat.is_actionable && onSeatClick && onSeatClick(seat)}
+                  onPointerDown={(e) => handlePointerDown(e, seat.id)}
                 >
                   <span style={{ fontSize: '20px', marginBottom: '4px' }}>
                     {getSeatIcon(seat)}
