@@ -9,12 +9,15 @@ from pathlib import Path
 from datetime import datetime
 
 import asyncio
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from dotenv import load_dotenv
 import google.generativeai as genai
 from typing import List
+import cv2
+import numpy as np
+import base64
 
 from models import (
     SeatStatusResponse, ZoneStatsResponse, SuggestionRequest, SuggestionResponse,
@@ -310,6 +313,120 @@ async def update_seating_map(request: dict):
     except Exception as e:
         logger.error(f"Error updating seating map: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auto-calibrate")
+async def auto_calibrate(strategy: str = Query("auto", description="Strategy: auto, gemini, opencv")):
+    """Analyze the current frame and return candidate seat bounding boxes."""
+    if not vision_engine:
+        raise HTTPException(status_code=503, detail="Vision engine not initialized")
+    
+    jpeg_bytes = vision_engine.get_latest_raw_frame_jpeg()
+    if not jpeg_bytes:
+        raise HTTPException(status_code=503, detail="No camera frame available")
+        
+    # --- Primary: Gemini API ---
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if gemini_api_key and strategy in ("auto", "gemini"):
+        try:
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            
+            image_blob = {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(jpeg_bytes).decode('utf-8')
+            }
+            
+            prompt = (
+                "Analyze this 640x480 venue image. Detect all individual seating positions (empty or occupied chairs, stools, benches). "
+                "Return a raw JSON array of exact bounding boxes representing each unique seat: "
+                "[{\"x\": int, \"y\": int, \"width\": int, \"height\": int}]. "
+                "Exclude tables and floors, just the seats. "
+                "Output ONLY the raw JSON list without markdown formatting or code blocks."
+            )
+            
+            response = model.generate_content([prompt, image_blob])
+            text = response.text.replace("```json", "").replace("```", "").strip()
+            boxes = json.loads(text)
+            
+            valid_boxes = [b for b in boxes if all(k in b for k in ('x', 'y', 'width', 'height'))]
+            if valid_boxes:
+                logger.info(f"Gemini auto-calibration found {len(valid_boxes)} seats")
+                return {"source": "gemini", "boxes": valid_boxes}
+        except Exception as e:
+            logger.warning(f"Gemini auto-calibration failed: {e}. Falling back to OpenCV.")
+            if strategy == "gemini":
+                # If explicitly asked for gemini and it failed, we could throw, 
+                # but fallback is safer for demos.
+                pass
+            
+    # --- Fallback: OpenCV ---
+    try:
+        nparr = np.frombuffer(jpeg_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        kernel = np.ones((3,3), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=1)
+        
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        boxes = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            if 2000 < area < 40000 and 10 < w < 300 and 10 < h < 300:
+                boxes.append({"x": int(x), "y": int(y), "width": int(w), "height": int(h)})
+                
+        logger.info(f"OpenCV fallback found {len(boxes)} seats")
+        return {"source": "opencv", "boxes": boxes}
+    except Exception as e:
+        logger.error(f"Auto-calibration completely failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to detect seats")
+
+@app.post("/api/upload-layout-image")
+async def upload_layout_image(file: UploadFile = File(...)):
+    """Accept an uploaded image and run Gemini bounding box extraction on it."""
+    try:
+        contents = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+        
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise HTTPException(status_code=503, detail="Gemini API key not configured")
+        
+    try:
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        
+        image_blob = {
+            "mime_type": file.content_type or "image/jpeg",
+            "data": base64.b64encode(contents).decode('utf-8')
+        }
+        
+        prompt = (
+            "Analyze this venue layout image. Detect all individual seating positions (empty or occupied chairs, stools, benches). "
+            "Return a raw JSON array of bounding boxes representing each unique seat: "
+            "[{\"x\": int, \"y\": int, \"width\": int, \"height\": int}]. "
+            "Exclude tables and floors, just the seats. Assume standard chair proportions. "
+            "Output ONLY the raw JSON list without markdown formatting or code blocks."
+        )
+        
+        response = model.generate_content([prompt, image_blob])
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        boxes = json.loads(text)
+        
+        valid_boxes = [b for b in boxes if all(k in b for k in ('x', 'y', 'width', 'height'))]
+        if valid_boxes:
+            logger.info(f"Upload layout Gemini auto-calibration found {len(valid_boxes)} seats")
+            return {"source": "gemini", "boxes": valid_boxes}
+        else:
+            return {"source": "gemini", "boxes": []}
+    except Exception as e:
+        logger.error(f"Upload layout gemini analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Layout analysis failed")
 
 
 @app.post("/api/config")

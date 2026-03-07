@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import SeatGrid from './SeatGrid';
 import CameraOverlay from './CameraOverlay';
 import { getSeats, getZones, getSuggestions, getConfig, updateConfig } from './api';
@@ -18,6 +18,8 @@ const Dashboard = () => {
   const [viewMode, setViewMode] = useState('camera'); // 'camera' or 'grid'
   const [isEditingLayout, setIsEditingLayout] = useState(false);
   const [editedSeats, setEditedSeats] = useState([]);
+  const [isAutoDetecting, setIsAutoDetecting] = useState(false);
+  const fileInputRef = useRef(null);
 
   const fetchData = async () => {
     try {
@@ -126,6 +128,90 @@ const Dashboard = () => {
       overlap_percentage: 0.0
     };
     setEditedSeats([...editedSeats, newSeat]);
+  };
+
+  const handleAutoDetect = async (strategy = 'auto') => {
+    setIsAutoDetecting(true);
+    try {
+      const response = await fetch(`http://localhost:8000/api/auto-calibrate?strategy=${strategy}`, {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        throw new Error('Failed to auto-detect seats');
+      }
+
+      const data = await response.json();
+      const defaultZone = zones.length > 0 ? zones[0].zone_name : "Default";
+
+      // Assign IDs to new boxes and shape them properly
+      const newSeats = data.boxes.map((box, idx) => ({
+        id: `Seat-Auto-${idx}-${Math.floor(Math.random() * 1000)}`,
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+        zone: defaultZone,
+        status: "Empty",
+        is_actionable: false,
+        overlap_percentage: 0.0
+      }));
+
+      // Append them so user doesn't lose previously hand-drawn boxes during session
+      setEditedSeats(prev => [...prev, ...newSeats]);
+
+    } catch (err) {
+      console.error(err);
+      setError(`Auto-calibration (${strategy}) failed. Check backend logs.`);
+    } finally {
+      setIsAutoDetecting(false);
+    }
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setIsAutoDetecting(true);
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const response = await fetch('http://localhost:8000/api/upload-layout-image', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to analyze uploaded layout');
+      }
+
+      const data = await response.json();
+      const defaultZone = zones.length > 0 ? zones[0].zone_name : "Default";
+
+      const newSeats = data.boxes.map((box, idx) => ({
+        id: `Seat-Upload-${idx}-${Math.floor(Math.random() * 1000)}`,
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+        zone: defaultZone,
+        status: "Empty",
+        is_actionable: false,
+        overlap_percentage: 0.0
+      }));
+
+      setEditedSeats(prev => [...prev, ...newSeats]);
+
+    } catch (err) {
+      console.error(err);
+      setError('Layout upload analysis failed. Check backend logs.');
+    } finally {
+      setIsAutoDetecting(false);
+      // Reset input so the same file could be selected again if needed
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
   };
 
   const handleSeatUpdate = (updatedSeat) => {
@@ -319,6 +405,47 @@ const Dashboard = () => {
                   Abstract Grid
                 </button>
                 <div style={{ width: '1px', backgroundColor: '#ccc', margin: '0 4px' }}></div>
+                {isEditingLayout && (
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    <button
+                      title="Use Gemini AI to analyze the live camera"
+                      onClick={() => handleAutoDetect('gemini')}
+                      disabled={isAutoDetecting}
+                      style={{
+                        padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: isAutoDetecting ? 'wait' : 'pointer',
+                        backgroundColor: '#673ab7', color: 'white', fontWeight: 'bold', transition: 'all 0.2s', opacity: isAutoDetecting ? 0.7 : 1
+                      }}>
+                      📷 Gemini
+                    </button>
+                    <button
+                      title="Use fast local math to analyze the live camera"
+                      onClick={() => handleAutoDetect('opencv')}
+                      disabled={isAutoDetecting}
+                      style={{
+                        padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: isAutoDetecting ? 'wait' : 'pointer',
+                        backgroundColor: '#0288d1', color: 'white', fontWeight: 'bold', transition: 'all 0.2s', opacity: isAutoDetecting ? 0.7 : 1
+                      }}>
+                      📐 OpenCV
+                    </button>
+                    <button
+                      title="Upload a layout image for AI analysis"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isAutoDetecting}
+                      style={{
+                        padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: isAutoDetecting ? 'wait' : 'pointer',
+                        backgroundColor: '#e91e63', color: 'white', fontWeight: 'bold', transition: 'all 0.2s', opacity: isAutoDetecting ? 0.7 : 1
+                      }}>
+                      🖼️ Upload
+                    </button>
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      style={{ display: 'none' }}
+                      accept="image/jpeg, image/png, image/webp"
+                      onChange={handleFileUpload}
+                    />
+                  </div>
+                )}
                 {isEditingLayout && (
                   <button
                     onClick={handleAddSeat}
