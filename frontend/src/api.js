@@ -106,4 +106,19 @@ export const updateConfig = async (configUpdate) => {
   }
 };
 
+export const getAnalyticsInsights = async () => {
+  try {
+    const response = await api.post('/api/analytics/insights');
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      throw new Error(`Server error: ${error.response.status} - ${error.response.data?.detail || 'AI insights unavailable'}`);
+    } else if (error.request) {
+      throw new Error('Network error: Could not reach the backend server.');
+    } else {
+      throw new Error(`Request error: ${error.message}`);
+    }
+  }
+};
+
 export default api;

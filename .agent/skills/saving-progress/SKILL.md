@@ -1,6 +1,6 @@
 ---
 name: saving-progress
-description: Saves the current project progress to the Git repository by securely checking for leaks, staging changes, writing a detailed commit message, and pushing to the main branch. ONLY invoke this skill when the user explicitly asks to save, commit, or push — NEVER auto-invoke during implementation.
+description: EXPLICIT MANUAL TRIGGER ONLY. Automates git add, commit, and push. ONLY invoke this skill when the user explicitly uses words like "commit", "push", or "save to github". NEVER invoke automatically after a task or when changes are done.
 ---
 
 # Saving Project Progress

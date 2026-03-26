@@ -1,0 +1,6 @@
+[Feature]: Advanced Auto-Detect Layout Suite
+
+- Integrated Python Multipart to support image uploads in FastAPI backend
+- Modified /api/auto-calibrate to accept Gemini and OpenCV strategies
+- Created /api/upload-layout-image endpoint for image-based layout detection
+- Updated Dashboard.jsx to include a three-button toolbar (Gemini, OpenCV, Upload) for layout generation options

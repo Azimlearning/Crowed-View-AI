@@ -23,12 +23,12 @@ Every project goes through this process. A todo list, a single-function utility,
 
 You MUST create a task for each of these items and complete them in order:
 
-- [ ] **1. Explore project context** — check files, docs, recent commits
-- [ ] **2. Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
-- [ ] **3. Propose 2-3 approaches** — with trade-offs and your recommendation
-- [ ] **4. Present design** — in sections scaled to their complexity, get user approval after each section
-- [ ] **5. Write design doc** — save to `docs/plans/YYYY-MM-DD-<topic>-design.md` and commit
-- [ ] **6. Transition to implementation** — invoke writing-plans skill to create implementation plan
+- [ ] **1. Explore project context** — check `prd.md`, `architecture.md`, `file_structure.md`, and relevant files.
+- [ ] **2. Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria.
+- [ ] **3. Propose 2-3 approaches** — with trade-offs and your recommendation.
+- [ ] **4. Present design** — in sections scaled to their complexity, get user approval after each section.
+- [ ] **5. Write design doc** — save to `architecture/` if high-level SOP, or `docs/plans/YYYY-MM-DD-<topic>-design.md`.
+- [ ] **6. Transition to implementation** — invoke `executing-plans` (for existing projects) OR `initializing-project` (for brand new projects).
 
 ## Process Flow
 
@@ -48,11 +48,11 @@ digraph brainstorming {
     "Present design sections" -> "User approves design?";
     "User approves design?" -> "Present design sections" [label="no, revise"];
     "User approves design?" -> "Write design doc" [label="yes"];
-    "Write design doc" -> "Invoke writing-plans skill";
+    "Write design doc" -> "Invoke executing-plans skill";
 }
 ```
 
-**The terminal state is invoking writing-plans.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is writing-plans.
+**The terminal state is invoking an implementation planning step.** Do NOT invoke frontend-design, mcp-builder, or any other execution-focused skill. The ONLY skills you invoke after brainstorming are `writing-plans` (existing projects) or `initializing-project` (brand new projects).
 
 ## Instructions
 
@@ -85,8 +85,9 @@ digraph brainstorming {
 - Commit the design document to git
 
 **Implementation:**
-- Invoke the writing-plans skill to create a detailed implementation plan
-- Do NOT invoke any other skill. writing-plans is the next step.
+- For existing projects, invoke the `writing-plans` skill to create a detailed implementation plan.
+- For brand new projects being started from scratch, invoke the `initializing-project` skill instead.
+- Do NOT invoke any other skill. These are the only allowed next steps.
 
 ## Key Principles
 

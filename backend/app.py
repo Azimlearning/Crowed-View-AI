@@ -10,10 +10,12 @@ from datetime import datetime
 
 import asyncio
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Query
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import OpenAI
 from typing import List
 import cv2
 import numpy as np
@@ -67,6 +69,9 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI app
 app = FastAPI(title="Venue Intelligence AI API", lifespan=lifespan)
+
+# Serve the data directory at /static so the frontend can fetch layout_background.jpg
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "data")), name="static")
 
 # CORS middleware for React frontend
 app.add_middleware(
@@ -279,10 +284,11 @@ async def websocket_seats(websocket: WebSocket):
             # Send current seat status every second
             if vision_engine:
                 seats = vision_engine.get_all_seats()
-                await websocket.send_json({
+                payload = jsonable_encoder({
                     "type": "seats_update",
                     "seats": [seat.model_dump() for seat in seats.values()]
                 })
+                await websocket.send_json(payload)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         websocket_connections.remove(websocket)
@@ -325,16 +331,13 @@ async def auto_calibrate(strategy: str = Query("auto", description="Strategy: au
         raise HTTPException(status_code=503, detail="No camera frame available")
         
     # --- Primary: Gemini API ---
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if gemini_api_key and strategy in ("auto", "gemini"):
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_api_key and strategy in ("auto", "gemini"):
         try:
-            genai.configure(api_key=gemini_api_key)
-            model = genai.GenerativeModel('gemini-1.5-pro')
-            
-            image_blob = {
-                "mime_type": "image/jpeg",
-                "data": base64.b64encode(jpeg_bytes).decode('utf-8')
-            }
+            client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=openrouter_api_key,
+            )
             
             prompt = (
                 "Analyze this 640x480 venue image. Detect all individual seating positions (empty or occupied chairs, stools, benches). "
@@ -344,18 +347,37 @@ async def auto_calibrate(strategy: str = Query("auto", description="Strategy: au
                 "Output ONLY the raw JSON list without markdown formatting or code blocks."
             )
             
-            response = model.generate_content([prompt, image_blob])
-            text = response.text.replace("```json", "").replace("```", "").strip()
+            base64_img = base64.b64encode(jpeg_bytes).decode('utf-8')
+            
+            response = client.chat.completions.create(
+                model="google/gemini-2.0-flash-lite-preview-02-05:free",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_img}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+            
+            text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
             boxes = json.loads(text)
             
             valid_boxes = [b for b in boxes if all(k in b for k in ('x', 'y', 'width', 'height'))]
             if valid_boxes:
-                logger.info(f"Gemini auto-calibration found {len(valid_boxes)} seats")
+                logger.info(f"OpenRouter auto-calibration found {len(valid_boxes)} seats")
                 return {"source": "gemini", "boxes": valid_boxes}
         except Exception as e:
-            logger.warning(f"Gemini auto-calibration failed: {e}. Falling back to OpenCV.")
+            logger.warning(f"OpenRouter auto-calibration failed: {e}. Falling back to OpenCV.")
             if strategy == "gemini":
-                # If explicitly asked for gemini and it failed, we could throw, 
+                # If explicitly asked for gemini and it failed, we could throw,
                 # but fallback is safer for demos.
                 pass
             
@@ -387,46 +409,132 @@ async def auto_calibrate(strategy: str = Query("auto", description="Strategy: au
 
 @app.post("/api/upload-layout-image")
 async def upload_layout_image(file: UploadFile = File(...)):
-    """Accept an uploaded image and run Gemini bounding box extraction on it."""
+    """Accept an uploaded image and run Gemini bounding box extraction on it.
+    
+    The image can be any size; Gemini normalizes coordinates relative to image dimensions.
+    The frontend should scale the returned boxes to match the canvas dimensions.
+    """
     try:
         contents = await file.read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+    
+    # Validate image content type
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type and file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Unsupported image type: {file.content_type}. Use JPEG, PNG, or WebP.")
         
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise HTTPException(status_code=503, detail="Gemini API key not configured")
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    if not openrouter_api_key:
+        raise HTTPException(status_code=503, detail="OpenRouter API key not configured. Add OPENROUTER_API_KEY to your .env file.")
+
+    try:
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Could not decode image.")
+        img_h, img_w = img.shape[:2]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image decode error: {e}")
         
     try:
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        
-        image_blob = {
-            "mime_type": file.content_type or "image/jpeg",
-            "data": base64.b64encode(contents).decode('utf-8')
-        }
-        
-        prompt = (
-            "Analyze this venue layout image. Detect all individual seating positions (empty or occupied chairs, stools, benches). "
-            "Return a raw JSON array of bounding boxes representing each unique seat: "
-            "[{\"x\": int, \"y\": int, \"width\": int, \"height\": int}]. "
-            "Exclude tables and floors, just the seats. Assume standard chair proportions. "
-            "Output ONLY the raw JSON list without markdown formatting or code blocks."
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_api_key,
         )
         
-        response = model.generate_content([prompt, image_blob])
-        text = response.text.replace("```json", "").replace("```", "").strip()
+        prompt = (
+            f"Analyze this venue layout image ({img_w}x{img_h} pixels). "
+            "Detect all individual seating positions (chairs, stools, benches — both empty and occupied). "
+            f"Return a raw JSON array of bounding boxes in pixel coordinates for this exact image size: "
+            "[{\"x\": int, \"y\": int, \"width\": int, \"height\": int}]. "
+            "x and y are the top-left corner. Exclude tables, floors, and standing areas — just the seats. "
+            "Output ONLY the raw JSON list without any markdown or code block wrappers."
+        )
+        
+        base64_img = base64.b64encode(contents).decode('utf-8')
+        mime_type = file.content_type or "image/jpeg"
+        
+        response = client.chat.completions.create(
+            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_img}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+        
+        text = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
         boxes = json.loads(text)
         
         valid_boxes = [b for b in boxes if all(k in b for k in ('x', 'y', 'width', 'height'))]
-        if valid_boxes:
-            logger.info(f"Upload layout Gemini auto-calibration found {len(valid_boxes)} seats")
-            return {"source": "gemini", "boxes": valid_boxes}
-        else:
-            return {"source": "gemini", "boxes": []}
+        logger.info(f"Upload layout: OpenRouter detected {len(valid_boxes)} seats in {img_w}x{img_h} image")
+        return {
+            "source": "gemini",
+            "boxes": valid_boxes,
+            "image_width": img_w,
+            "image_height": img_h,
+        }
     except Exception as e:
         logger.error(f"Upload layout gemini analysis failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Layout analysis failed")
+        raise HTTPException(status_code=500, detail=f"Layout analysis failed: {str(e)}")
+
+
+@app.post("/api/upload-background")
+async def upload_background(file: UploadFile = File(...)):
+    """Save an uploaded image as the venue reference background.
+    
+    The image is saved to data/layout_background.jpg and served at /static/layout_background.jpg.
+    The frontend can display this image behind the seat canvas for assisted manual placement.
+    No AI detection is run — this is purely for visual reference.
+    """
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type and file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Unsupported image type: {file.content_type}")
+    
+    try:
+        contents = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+    
+    # Decode then re-encode as JPEG (normalises PNG/WebP to a single consistent format)
+    try:
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Could not decode image.")
+        img_h, img_w = img.shape[:2]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image decode error: {e}")
+    
+    dest_path = BASE_DIR / "data" / "layout_background.jpg"
+    success, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to encode image as JPEG")
+    
+    with open(dest_path, "wb") as f:
+        f.write(buf.tobytes())
+    
+    logger.info(f"Background image saved: {img_w}x{img_h} → {dest_path}")
+    return {
+        "message": "Background image saved successfully",
+        "url": "/static/layout_background.jpg",
+        "image_width": img_w,
+        "image_height": img_h,
+    }
 
 
 @app.post("/api/config")
@@ -470,6 +578,101 @@ async def get_config():
         "debug_detection": vision_engine.config.debug_detection,
     }
 
+@app.get("/api/analytics/events")
+async def get_analytics_events(limit: int = 50):
+    """Return the most recent seat change events from the SQLite log (debug/review)."""
+    import db_logger as _db
+    return {"events": _db.get_recent_events(limit=limit)}
+
+
+@app.post("/api/analytics/insights")
+async def get_analytics_insights():
+    """Generate an AI-powered trend analysis report using in-session history snapshots.
+    
+    Bundles the in-memory history_snapshots (zone occupancy over time) and sends
+    them to Gemini 1.5 Flash for timeline-aware operational insights.
+    """
+    if not vision_engine:
+        raise HTTPException(status_code=503, detail="Vision engine not initialized")
+
+    snapshots = vision_engine.history_snapshots
+    current_zones = vision_engine.get_zones()
+
+    # Build current snapshot summary for Gemini context
+    current_summary_lines = []
+    for zone_name, zone in current_zones.items():
+        total = len(zone.seats)
+        occupied = sum(1 for s in zone.seats if s.status == "Occupied")
+        actionable = sum(1 for s in zone.seats if s.is_actionable)
+        empty_pct = round((total - occupied) / total * 100, 1) if total > 0 else 0.0
+        current_summary_lines.append(
+            f"  - {zone_name}: {occupied}/{total} occupied ({100-empty_pct:.1f}% fill rate), "
+            f"{actionable} actionable seat(s)"
+        )
+    current_summary = "\n".join(current_summary_lines)
+
+    # Build snapshot timeline string (last 12 snapshots = 1 hour at 5-min intervals)
+    recent_snapshots = snapshots[-12:] if len(snapshots) > 12 else snapshots
+    if recent_snapshots:
+        timeline_lines = []
+        for snap in recent_snapshots:
+            ts = snap["timestamp"]
+            zone_parts = ", ".join(
+                f"{z['zone_name']}: {z['occupied_seats']}/{z['total_seats']} occupied"
+                for z in snap["zones"]
+            )
+            timeline_lines.append(f"  [{ts}] {zone_parts}")
+        timeline_str = "\n".join(timeline_lines)
+        timeline_context = f"Occupancy timeline (last {len(recent_snapshots)} snapshots, 5-min intervals):\n{timeline_str}"
+    else:
+        timeline_context = "No historical snapshots yet (system started recently — analytics based on current state only)."
+
+    # Load event type from config
+    with open(CONFIG_PATH, 'r') as f:
+        config_data = json.load(f)
+    event_type = config_data.get('event_type', 'Event')
+
+    openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
+    if not openrouter_api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not configured")
+
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_api_key,
+        )
+
+        prompt = (
+            f"You are an AI Venue Intelligence Analyst for a live {event_type}. "
+            f"Your job is to synthesize real-time and historical seat occupancy data into "
+            f"a concise, actionable analytics report for a venue manager.\n\n"
+            f"## Current State\n{current_summary}\n\n"
+            f"## {timeline_context}\n\n"
+            f"## Your Task\n"
+            f"Write a short operational analytics report (3-5 sentences max) covering:\n"
+            f"1. **Trend**: Is occupancy rising, stable, or declining compared to earlier?\n"
+            f"2. **Hotspots**: Which zone needs the most immediate attention and why?\n"
+            f"3. **Recommendation**: One specific, high-priority action the venue manager should take right now.\n\n"
+            f"Keep the tone professional and data-driven. Do not use markdown headers — plain readable text only."
+        )
+
+        response = client.chat.completions.create(
+            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        insight_text = response.choices[0].message.content.strip()
+
+        return {
+            "insight": insight_text,
+            "snapshot_count": len(snapshots),
+            "current_summary": current_summary,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    except Exception as e:
+        logger.error(f"Analytics insights generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analytics generation failed: {str(e)}")
+
 
 @app.post("/api/suggestions", response_model=SuggestionResponse)
 async def get_suggestions(request: SuggestionRequest):
@@ -511,14 +714,16 @@ async def get_suggestions(request: SuggestionRequest):
         config_data = json.load(f)
     event_type = config_data.get('event_type', 'Event')
     
-    # Generate suggestions using Gemini API
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    if not gemini_api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
+    # Generate suggestions using OpenRouter
+    openrouter_api_key = os.getenv('OPENROUTER_API_KEY')
+    if not openrouter_api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not configured")
     
     try:
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openrouter_api_key,
+        )
         
         prompt = (
             f"You are an AI assistant for a Smart Building Management system. "
@@ -538,8 +743,11 @@ async def get_suggestions(request: SuggestionRequest):
             f"Each suggestion must start with the category in brackets, e.g. [Energy] or [Venue]."
         )
         
-        response = model.generate_content(prompt)
-        suggestions_text = response.text.strip()
+        response = client.chat.completions.create(
+            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        suggestions_text = response.choices[0].message.content.strip()
         
         # Parse suggestions (split by newlines and clean up)
         suggestions = [

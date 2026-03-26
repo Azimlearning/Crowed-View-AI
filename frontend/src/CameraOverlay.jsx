@@ -4,7 +4,7 @@ import './CameraOverlay.css';
 const NATIVE_WIDTH = 640;
 const NATIVE_HEIGHT = 480;
 
-const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSeatUpdate, onSeatDelete }) => {
+const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSeatUpdate, onSeatDelete, backgroundImageUrl }) => {
     const containerRef = useRef(null);
     const [scale, setScale] = useState({ x: 1, y: 1 });
     const [hoveredSeat, setHoveredSeat] = useState(null);
@@ -182,6 +182,24 @@ const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSea
                         onLoad={() => setStreamError(false)}
                     />
 
+                    {/* Reference background image overlay (shown during editing) */}
+                    {isEditingLayout && backgroundImageUrl && (
+                        <img
+                            src={backgroundImageUrl}
+                            alt="Reference layout background"
+                            style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                width: '100%',
+                                height: '100%',
+                                objectFit: 'cover',
+                                opacity: 0.45,
+                                pointerEvents: 'none',
+                                zIndex: 0,
+                            }}
+                        />
+                    )}
                     {/* Render seats overlay */}
                     {seats.map(seat => {
                         const isHovered = hoveredSeat === seat.id;

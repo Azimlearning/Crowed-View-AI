@@ -265,6 +265,47 @@ def test_environment():
         print("[INFO] CAMERA_INDEX not set (will try indices 0, 1, 2)")
     
     return True
+    
+
+def test_rtsp_camera():
+    """Test RTSP camera access if configured."""
+    rtsp_url = os.getenv('RTSP_URL')
+    if not rtsp_url:
+        print("\n" + "=" * 60)
+        print("Testing RTSP Camera")
+        print("=" * 60)
+        print("[SKIP] RTSP_URL not set in .env")
+        return None
+        
+    print("\n" + "=" * 60)
+    print("Testing RTSP Camera Access")
+    print("=" * 60)
+    print(f"Connecting to: {rtsp_url[:40]}...")
+    
+    try:
+        import cv2
+        
+        # Try to open RTSP stream
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(rtsp_url)
+            
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                height, width = frame.shape[:2]
+                print(f"[OK] RTSP Camera opened successfully")
+                print(f"  Resolution: {width}x{height}")
+                cap.release()
+                return True
+            cap.release()
+            
+        print("[X] RTSP camera could not be opened")
+        return False
+        
+    except Exception as e:
+        print(f"✗ RTSP Camera test failed: {e}")
+        return False
 
 
 def main():
@@ -279,6 +320,7 @@ def main():
         'yolo': test_yolo_model(),
         'config': test_configuration(),
         'vision_engine': test_vision_engine(),
+        'rtsp_camera': test_rtsp_camera(),
         'api': test_api_connectivity(),
         'environment': test_environment(),
     }

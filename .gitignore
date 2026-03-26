@@ -39,3 +39,14 @@ Thumbs.db
 
 # YOLOv8 model cache (optional - can be large)
 .ultralytics/
+
+# Temporary files
+.temp/
+.temp
+
+# Agent files
+.agent/
+.agents/
+
+# Documentation plans
+docs/plans/

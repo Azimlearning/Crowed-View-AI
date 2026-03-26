@@ -29,6 +29,7 @@ from ultralytics import YOLO
 
 from models import Seat, Zone, EventConfig
 from logger_config import get_logger
+import db_logger
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,13 @@ class VisionEngine:
         # Temporal tracking for new occupancy logic
         self._seat_first_overlap_time: Dict[str, Optional[datetime]] = {}  # When 60% overlap first started
         self._seat_last_overlap: Dict[str, float] = {}  # Last computed overlap per seat
+
+        # In-memory analytics history: list of zone snapshots taken every 5 minutes.
+        # Each entry: {"timestamp": ISO str, "zones": [{zone_name, total, occupied, empty, actionable, empty_pct}]}
+        # Capped at 288 entries (24 hours at 5-min intervals) to bound memory.
+        self.history_snapshots: List[dict] = []
+        self._last_snapshot_time: float = 0.0
+        self._snapshot_interval_seconds: float = 300.0  # 5 minutes
 
         self._load_config()
         self._load_seating_map()
@@ -327,6 +335,7 @@ class VisionEngine:
                     seat.is_actionable = False
                     seat.vacancy_timer_start = None
                     self._seat_first_overlap_time[seat.id] = None
+                    db_logger.log_seat_change(seat.id, "Occupied")
                 else:
                     # Start or continue confirmation timer
                     if self._seat_first_overlap_time.get(seat.id) is None:
@@ -340,6 +349,7 @@ class VisionEngine:
                         seat.is_actionable = False
                         seat.vacancy_timer_start = None
                         self._seat_first_overlap_time[seat.id] = None
+                        db_logger.log_seat_change(seat.id, "Occupied")
             else:
                 # Not covered — reset confirmation timer
                 self._seat_first_overlap_time[seat.id] = None
@@ -357,6 +367,7 @@ class VisionEngine:
                     seat.is_actionable = False
                     seat.vacancy_timer_start = None
                     self._seat_first_overlap_time[seat.id] = None
+                    db_logger.log_seat_change(seat.id, "Empty")
                 else:
                     # Start or continue vacancy grace period
                     if seat.vacancy_timer_start is None:
@@ -370,6 +381,7 @@ class VisionEngine:
                         seat.is_actionable = False
                         seat.vacancy_timer_start = None
                         self._seat_first_overlap_time[seat.id] = None
+                        db_logger.log_seat_change(seat.id, "Empty")
 
     def update_actionable_flags(self):
         """Update actionable flags based on empty duration thresholds."""
@@ -389,6 +401,44 @@ class VisionEngine:
                     seat.is_actionable = empty_duration >= threshold_minutes
                 else:
                     seat.is_actionable = False
+
+    def take_history_snapshot(self) -> None:
+        """Append a zone-level occupancy snapshot to history_snapshots if 5 minutes have elapsed.
+        
+        Called from within the detection loop (under self.lock). Keeps a rolling
+        window of up to 288 snapshots (24 hours at 5-min intervals).
+        """
+        now_ts = time.time()
+        if now_ts - self._last_snapshot_time < self._snapshot_interval_seconds:
+            return
+
+        snapshot_zones = []
+        for zone_name, zone in self.zones.items():
+            total = len(zone.seats)
+            occupied = sum(1 for s in zone.seats if s.status == "Occupied")
+            actionable = sum(1 for s in zone.seats if s.is_actionable)
+            empty = total - occupied
+            empty_pct = round((empty / total * 100), 1) if total > 0 else 0.0
+            snapshot_zones.append({
+                "zone_name": zone_name,
+                "total_seats": total,
+                "occupied_seats": occupied,
+                "empty_seats": empty,
+                "actionable_seats": actionable,
+                "empty_percentage": empty_pct,
+            })
+
+        self.history_snapshots.append({
+            "timestamp": datetime.now().isoformat(timespec="minutes"),
+            "zones": snapshot_zones,
+        })
+
+        # Cap at 288 entries (rolling 24-hour window)
+        if len(self.history_snapshots) > 288:
+            self.history_snapshots = self.history_snapshots[-288:]
+
+        self._last_snapshot_time = now_ts
+        logger.debug(f"History snapshot taken. Total snapshots: {len(self.history_snapshots)}")
 
     def detect_persons(self, frame) -> List[Tuple[int, int, int, int]]:
         """
@@ -452,6 +502,34 @@ class VisionEngine:
         """Try to open webcam or video file; on Windows use DirectShow first, then try indices 0, 1, 2."""
         import sys
         
+        # Try RTSP URL from environment variable first
+        rtsp_url = os.getenv("RTSP_URL")
+        if rtsp_url:
+            logger.info(f"Attempting RTSP connection: {rtsp_url[:30]}...")
+            # Use CAP_FFMPEG for stable H.264 decoding on Windows
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self.cap = cap
+                    self._is_video_file = False
+                    logger.info("RTSP stream opened successfully via CAP_FFMPEG")
+                    return True
+                cap.release()
+            
+            # Fallback: try without explicit backend
+            logger.warning("CAP_FFMPEG failed, trying default backend for RTSP...")
+            cap = cv2.VideoCapture(rtsp_url)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self.cap = cap
+                    self._is_video_file = False
+                    logger.info("RTSP stream opened successfully (default backend)")
+                    return True
+                cap.release()
+            logger.error("Could not open RTSP stream. Check IP, password, and WiFi. Falling back to local webcam/file.")
+
         # Check for video file path in environment variable
         video_path = os.getenv("VIDEO_FILE_PATH")
         if video_path and Path(video_path).exists():
@@ -592,6 +670,8 @@ class VisionEngine:
                             
                             # Always update actionable flags — runs after both YOLO and no-motion paths
                             self.update_actionable_flags()
+                            # Take a history snapshot every 5 minutes for AI analytics
+                            self.take_history_snapshot()
                     
                     last_detection_time = current_time
                     logger.debug(f"Detection completed at {datetime.now().strftime('%H:%M:%S')}")
@@ -674,6 +754,21 @@ class VisionEngine:
             return buf.tobytes()
         except Exception as e:
             logger.error(f"Error encoding frame to JPEG: {e}", exc_info=True)
+            return None
+
+    def get_latest_raw_frame_jpeg(self) -> bytes | None:
+        """Return the latest unaltered camera frame as JPEG."""
+        try:
+            with self.lock:
+                if self._last_frame is None:
+                    return None
+                img = self._last_frame.copy()
+            success, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not success or buf is None:
+                return None
+            return buf.tobytes()
+        except Exception as e:
+            logger.error(f"Error encoding raw frame to JPEG: {e}", exc_info=True)
             return None
 
     def cleanup(self):

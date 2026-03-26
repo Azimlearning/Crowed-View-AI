@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import SeatGrid from './SeatGrid';
 import CameraOverlay from './CameraOverlay';
-import { getSeats, getZones, getSuggestions, getConfig, updateConfig } from './api';
+import { getSeats, getZones, getSuggestions, getConfig, updateConfig, getAnalyticsInsights } from './api';
 import './Dashboard.css';
 
 const Dashboard = () => {
@@ -19,8 +19,50 @@ const Dashboard = () => {
   const [isEditingLayout, setIsEditingLayout] = useState(false);
   const [editedSeats, setEditedSeats] = useState([]);
   const [isAutoDetecting, setIsAutoDetecting] = useState(false);
-  const fileInputRef = useRef(null);
+  const fileInputRef = useRef(null); // legacy, only used by OpenCV/auto-calibrate
+  const geminiFileInputRef = useRef(null); // Gemini: upload image for AI seat detection
+  const bgFileInputRef = useRef(null);      // Upload: set a reference background image
 
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [analyticsError, setAnalyticsError] = useState(null);
+  const [backgroundImageUrl, setBackgroundImageUrl] = useState(null); // reference bg image in edit mode
+
+  // WebSocket state
+  const [wsStatus, setWsStatus] = useState('connecting'); // 'live' | 'connecting' | 'error'
+  const wsRef = useRef(null);
+  const wsReconnectTimer = useRef(null);
+
+
+  // Load initial config to sync testing mode toggle
+  useEffect(() => {
+    const loadConfig = async () => {
+      try {
+        const cfg = await getConfig();
+        setConfig(cfg);
+        setTestingMode(cfg.testing_mode || false);
+        setConfigLoaded(true);
+      } catch (err) {
+        console.error('Error loading config:', err);
+      }
+    };
+    loadConfig();
+  }, []);
+
+  // Fetch zones only (seats come via WebSocket)
+  const fetchZones = async () => {
+    try {
+      const zonesData = await getZones();
+      setZones(Array.isArray(zonesData) ? zonesData : []);
+      setError(null);
+    } catch (err) {
+      console.error('Error fetching zones:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Legacy fetchData used by edit-mode save (still fetches both for a one-shot refresh)
   const fetchData = async () => {
     try {
       const [seatsData, zonesData] = await Promise.all([
@@ -38,26 +80,66 @@ const Dashboard = () => {
     }
   };
 
-  // Load initial config to sync testing mode toggle
+  // --- WebSocket effect: real-time seat updates ---
   useEffect(() => {
-    const loadConfig = async () => {
-      try {
-        const cfg = await getConfig();
-        setConfig(cfg);
-        setTestingMode(cfg.testing_mode || false);
-        setConfigLoaded(true);
-      } catch (err) {
-        console.error('Error loading config:', err);
-      }
-    };
-    loadConfig();
-  }, []);
+    if (isEditingLayout) {
+      // Close WS while editing to avoid stale overwrites
+      if (wsRef.current) wsRef.current.close();
+      return;
+    }
 
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) return;
+      setWsStatus('connecting');
+      const WS_URL = 'ws://localhost:8000/ws/seats';
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!cancelled) setWsStatus('live');
+      };
+
+      ws.onmessage = (event) => {
+        if (cancelled) return;
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'seats_update' && Array.isArray(msg.seats)) {
+            setSeats(msg.seats);
+            setLoading(false);
+          }
+        } catch (e) {
+          console.warn('WS parse error:', e);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!cancelled) setWsStatus('error');
+      };
+
+      ws.onclose = () => {
+        if (cancelled) return;
+        setWsStatus('connecting');
+        // Auto-reconnect after 3 seconds
+        wsReconnectTimer.current = setTimeout(connect, 3000);
+      };
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(wsReconnectTimer.current);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [isEditingLayout]);
+
+  // --- Zone polling effect: 10-second interval (zones are aggregate, less time-critical) ---
   useEffect(() => {
-    if (isEditingLayout) return; // Pause polling while editing
-    fetchData();
-    // Poll every 5 seconds
-    const interval = setInterval(fetchData, 5000);
+    if (isEditingLayout) return;
+    fetchZones(); // initial load
+    const interval = setInterval(fetchZones, 10000);
     return () => clearInterval(interval);
   }, [isEditingLayout]);
 
@@ -167,13 +249,18 @@ const Dashboard = () => {
     }
   };
 
-  const handleFileUpload = async (event) => {
+  /**
+   * Gemini Button: user picks an image → Gemini detects seats → boxes appended to editedSeats.
+   * Boxes returned by backend are in image-native pixels; we scale them to the 640×480
+   * camera canvas coordinate space so they land in sensible positions on the map.
+   */
+  const handleGeminiImageUpload = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
 
     setIsAutoDetecting(true);
     const formData = new FormData();
-    formData.append("file", file);
+    formData.append('file', file);
 
     try {
       const response = await fetch('http://localhost:8000/api/upload-layout-image', {
@@ -182,37 +269,75 @@ const Dashboard = () => {
       });
 
       if (!response.ok) {
-        throw new Error('Failed to analyze uploaded layout');
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Gemini layout analysis failed');
       }
 
       const data = await response.json();
-      const defaultZone = zones.length > 0 ? zones[0].zone_name : "Default";
+      const defaultZone = zones.length > 0 ? zones[0].zone_name : 'Default';
+
+      // Scale coordinates from the uploaded image size to the 640×480 canvas
+      const scaleX = data.image_width  ? 640 / data.image_width  : 1;
+      const scaleY = data.image_height ? 480 / data.image_height : 1;
 
       const newSeats = data.boxes.map((box, idx) => ({
-        id: `Seat-Upload-${idx}-${Math.floor(Math.random() * 1000)}`,
-        x: box.x,
-        y: box.y,
-        width: box.width,
-        height: box.height,
+        id: `Seat-Gemini-${idx}-${Math.floor(Math.random() * 1000)}`,
+        x: Math.round(box.x * scaleX),
+        y: Math.round(box.y * scaleY),
+        width:  Math.round(box.width  * scaleX),
+        height: Math.round(box.height * scaleY),
         zone: defaultZone,
-        status: "Empty",
+        status: 'Empty',
         is_actionable: false,
-        overlap_percentage: 0.0
+        overlap_percentage: 0.0,
       }));
 
       setEditedSeats(prev => [...prev, ...newSeats]);
 
     } catch (err) {
       console.error(err);
-      setError('Layout upload analysis failed. Check backend logs.');
+      setError(`Gemini image analysis failed: ${err.message}`);
     } finally {
       setIsAutoDetecting(false);
-      // Reset input so the same file could be selected again if needed
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      if (geminiFileInputRef.current) geminiFileInputRef.current.value = '';
     }
   };
+
+  /**
+   * Upload (Background) Button: user picks an image → saved as reference background.
+   * No AI detection is run — purely visual reference behind the seat canvas.
+   */
+  const handleBackgroundUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setIsAutoDetecting(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('http://localhost:8000/api/upload-background', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Background upload failed');
+      }
+
+      // Append cache-busting query to force reload of the same filename
+      setBackgroundImageUrl(`http://localhost:8000/static/layout_background.jpg?t=${Date.now()}`);
+
+    } catch (err) {
+      console.error(err);
+      setError(`Background upload failed: ${err.message}`);
+    } finally {
+      setIsAutoDetecting(false);
+      if (bgFileInputRef.current) bgFileInputRef.current.value = '';
+    }
+  };
+
 
   const handleSeatUpdate = (updatedSeat) => {
     setEditedSeats(prev => prev.map(s => s.id === updatedSeat.id ? updatedSeat : s));
@@ -252,6 +377,26 @@ const Dashboard = () => {
     setSuggestions(null);
   };
 
+  const handleGetAnalytics = async () => {
+    setAnalyticsLoading(true);
+    setAnalyticsError(null);
+    try {
+      const data = await getAnalyticsInsights();
+      setAnalyticsData(data);
+    } catch (err) {
+      console.error('Analytics error:', err);
+      setAnalyticsError(err.message);
+      setAnalyticsData({ insight: null, error: err.message });
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  };
+
+  const closeAnalytics = () => {
+    setAnalyticsData(null);
+    setAnalyticsError(null);
+  };
+
   if (loading && seats.length === 0) {
     return (
       <div className="dashboard-loading">
@@ -266,10 +411,38 @@ const Dashboard = () => {
       <header className="dashboard-header">
         <h1>Venue Intelligence AI Dashboard</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-          <div className="status-indicator">
-            <span className="status-dot"></span>
-            <span>Live</span>
+          <div className="status-indicator" title={`WebSocket: ${wsStatus}`}>
+            <span className="status-dot" style={{
+              backgroundColor:
+                wsStatus === 'live' ? '#4caf50' :
+                wsStatus === 'connecting' ? '#ff9800' : '#f44336'
+            }}></span>
+            <span style={{ color:
+              wsStatus === 'live' ? '#4caf50' :
+              wsStatus === 'connecting' ? '#ff9800' : '#f44336'
+            }}>
+              {wsStatus === 'live' ? 'Live' : wsStatus === 'connecting' ? 'Connecting…' : 'Disconnected'}
+            </span>
           </div>
+          <button
+            onClick={handleGetAnalytics}
+            disabled={analyticsLoading}
+            style={{
+              padding: '6px 14px',
+              background: 'linear-gradient(135deg, #667eea, #764ba2)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: analyticsLoading ? 'wait' : 'pointer',
+              fontSize: '13px',
+              fontWeight: 'bold',
+              transition: 'opacity 0.2s',
+              opacity: analyticsLoading ? 0.7 : 1,
+            }}
+            title="Generate a real-time AI trend analysis for this session"
+          >
+            {analyticsLoading ? '⏳ Analyzing...' : '📊 Live AI Analytics'}
+          </button>
           <button
             onClick={handleTestingModeToggle}
             style={{
@@ -408,8 +581,8 @@ const Dashboard = () => {
                 {isEditingLayout && (
                   <div style={{ display: 'flex', gap: '4px' }}>
                     <button
-                      title="Use Gemini AI to analyze the live camera"
-                      onClick={() => handleAutoDetect('gemini')}
+                      title="Upload a photo of your venue — Gemini AI will detect and generate seat boxes from the image"
+                      onClick={() => geminiFileInputRef.current?.click()}
                       disabled={isAutoDetecting}
                       style={{
                         padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: isAutoDetecting ? 'wait' : 'pointer',
@@ -428,8 +601,8 @@ const Dashboard = () => {
                       📐 OpenCV
                     </button>
                     <button
-                      title="Upload a layout image for AI analysis"
-                      onClick={() => fileInputRef.current?.click()}
+                      title="Upload a reference background image (no AI detection — for manual seat placement)"
+                      onClick={() => bgFileInputRef.current?.click()}
                       disabled={isAutoDetecting}
                       style={{
                         padding: '6px 12px', border: 'none', borderRadius: '4px', cursor: isAutoDetecting ? 'wait' : 'pointer',
@@ -437,12 +610,21 @@ const Dashboard = () => {
                       }}>
                       🖼️ Upload
                     </button>
+                    {/* Hidden: Gemini image input (for AI seat detection from a photo) */}
                     <input
                       type="file"
-                      ref={fileInputRef}
+                      ref={geminiFileInputRef}
                       style={{ display: 'none' }}
-                      accept="image/jpeg, image/png, image/webp"
-                      onChange={handleFileUpload}
+                      accept="image/jpeg,image/png,image/webp"
+                      onChange={handleGeminiImageUpload}
+                    />
+                    {/* Hidden: background reference image input */}
+                    <input
+                      type="file"
+                      ref={bgFileInputRef}
+                      style={{ display: 'none' }}
+                      accept="image/jpeg,image/png,image/webp"
+                      onChange={handleBackgroundUpload}
                     />
                   </div>
                 )}
@@ -508,6 +690,7 @@ const Dashboard = () => {
                 isEditingLayout={isEditingLayout}
                 onSeatUpdate={handleSeatUpdate}
                 onSeatDelete={handleSeatDelete}
+                backgroundImageUrl={backgroundImageUrl}
               />
             ) : (
               <SeatGrid
@@ -560,6 +743,52 @@ const Dashboard = () => {
                 );
               })}
             </ul>
+          </div>
+        </div>
+      )}
+
+      {/* === AI Analytics Modal === */}
+      {analyticsData && (
+        <div className="suggestions-modal" onClick={closeAnalytics}>
+          <div className="suggestions-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '560px' }}>
+            <button className="close-button" onClick={closeAnalytics}>x</button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+              <span style={{ fontSize: '22px' }}>📊</span>
+              <h2 style={{ margin: 0 }}>Live Event Analytics</h2>
+            </div>
+            {analyticsData.snapshot_count > 0 && (
+              <div style={{
+                display: 'inline-block', padding: '3px 10px', marginBottom: '14px',
+                background: 'linear-gradient(135deg, #667eea22, #764ba222)',
+                border: '1px solid #764ba255', borderRadius: '20px',
+                fontSize: '12px', color: '#764ba2'
+              }}>
+                Based on {analyticsData.snapshot_count} snapshot{analyticsData.snapshot_count !== 1 ? 's' : ''} from this session
+              </div>
+            )}
+            {analyticsData.insight ? (
+              <div style={{
+                background: 'linear-gradient(135deg, #f8f9ff, #f0f0ff)',
+                border: '1px solid #ddd8ff',
+                borderRadius: '10px',
+                padding: '16px 20px',
+                fontSize: '15px',
+                lineHeight: '1.7',
+                color: '#2d2d4e',
+                fontStyle: 'normal',
+                whiteSpace: 'pre-line'
+              }}>
+                {analyticsData.insight}
+              </div>
+            ) : (
+              <div style={{ color: '#e53935', padding: '12px' }}>
+                ⚠️ {analyticsData.error || 'Could not generate insights.'}
+              </div>
+            )}
+            <div style={{ marginTop: '14px', fontSize: '12px', color: '#999' }}>
+              Generated at {analyticsData.generated_at}
+              {' '}· Powered by Gemini 1.5 Flash
+            </div>
           </div>
         </div>
       )}
