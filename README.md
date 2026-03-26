@@ -38,6 +38,7 @@ CrowdView AI/
 ├── data/
 │   ├── seating_map.json # Seat coordinates and zones
 │   └── config.json     # Event configuration
+├── docs/                # Project documentation and notes
 ├── logs/                # Log files (created automatically)
 ├── .env.example        # Environment variables template
 └── requirements.txt

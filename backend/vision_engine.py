@@ -181,6 +181,9 @@ class VisionEngine:
                 self._seat_first_overlap_time[sid] = None
             if sid not in self._seat_last_overlap:
                 self._seat_last_overlap[sid] = 0.0
+        self._frame_subscribers = []
+        self._rtsp_connected = False
+        self._rtsp_error_message = None
         
         # Validate configuration after loading
         self._validate_configuration()
@@ -499,36 +502,33 @@ class VisionEngine:
     # -----------------------------------------------------------------------
 
     def _open_webcam(self):
-        """Try to open webcam or video file; on Windows use DirectShow first, then try indices 0, 1, 2."""
+        """Attempts to open an RTSP stream (if configured) or a local webcam/video."""
         import sys
-        
-        # Try RTSP URL from environment variable first
         rtsp_url = os.getenv("RTSP_URL")
+        
         if rtsp_url:
-            logger.info(f"Attempting RTSP connection: {rtsp_url[:30]}...")
-            # Use CAP_FFMPEG for stable H.264 decoding on Windows
-            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    self.cap = cap
-                    self._is_video_file = False
-                    logger.info("RTSP stream opened successfully via CAP_FFMPEG")
-                    return True
-                cap.release()
+            logger.info("RTSP_URL found, attempting to connect to IP camera...")
+            transport = os.getenv("RTSP_TRANSPORT", "tcp").lower()
+            if transport in ["tcp", "udp"]:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
             
-            # Fallback: try without explicit backend
-            logger.warning("CAP_FFMPEG failed, trying default backend for RTSP...")
-            cap = cv2.VideoCapture(rtsp_url)
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            
+            if not cap.isOpened():
+                logger.warning(f"Failed FFMPEG capture with {transport}. Falling back to default.")
+                cap = cv2.VideoCapture(rtsp_url)
+                
             if cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    self.cap = cap
-                    self._is_video_file = False
-                    logger.info("RTSP stream opened successfully (default backend)")
-                    return True
-                cap.release()
-            logger.error("Could not open RTSP stream. Check IP, password, and WiFi. Falling back to local webcam/file.")
+                self.cap = cap
+                self._is_video_file = False
+                self._rtsp_connected = True
+                self._rtsp_error_message = None
+                logger.info("Successfully connected to RTSP stream.")
+                return True
+            else:
+                self._rtsp_connected = False
+                self._rtsp_error_message = "Could not open RTSP stream. Check URL, safety code, or network."
+                logger.error("Failed to connect to RTSP stream. Falling back to local webcam/file.")
 
         # Check for video file path in environment variable
         video_path = os.getenv("VIDEO_FILE_PATH")

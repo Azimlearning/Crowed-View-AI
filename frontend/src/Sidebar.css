@@ -1,0 +1,102 @@
+/* =============================================
+   Sidebar.css — CrowdView AI Sidebar Navigation
+   ============================================= */
+
+.sidebar {
+  width: 240px;
+  min-height: 100vh;
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+/* ---- Brand ---- */
+.sidebar__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-4);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.sidebar__logo-mark {
+  width: 32px;
+  height: 32px;
+  background: var(--color-primary);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -1px;
+  flex-shrink: 0;
+}
+
+.sidebar__brand-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+/* ---- Nav ---- */
+.sidebar__nav {
+  flex: 1;
+  padding: var(--space-3) var(--space-3);
+}
+
+.sidebar__nav-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar__nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: 9px var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: left;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  min-height: 44px;
+}
+
+.sidebar__nav-item:hover {
+  background: var(--bg-page);
+  color: var(--text-primary);
+}
+
+.sidebar__nav-item--active {
+  background: var(--color-primary-light);
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.sidebar__nav-item--active:hover {
+  background: var(--color-primary-light);
+  color: var(--color-primary);
+}
+
+/* ---- Bottom ---- */
+.sidebar__bottom {
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-default);
+}

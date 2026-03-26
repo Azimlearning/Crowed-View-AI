@@ -1,4 +1,11 @@
-.App {
-  width: 100%;
+/* App.css — shell layout */
+.app-shell {
+  display: flex;
   min-height: 100vh;
+  background: var(--bg-page);
+}
+
+.app-shell > .dashboard {
+  flex: 1;
+  min-width: 0;
 }

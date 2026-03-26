@@ -4,7 +4,7 @@ import './CameraOverlay.css';
 const NATIVE_WIDTH = 640;
 const NATIVE_HEIGHT = 480;
 
-const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSeatUpdate, onSeatDelete, backgroundImageUrl }) => {
+const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSeatUpdate, onSeatDelete, backgroundImageUrl, zones = [], selectedSeatId = null, setSelectedSeatId = null }) => {
     const containerRef = useRef(null);
     const [scale, setScale] = useState({ x: 1, y: 1 });
     const [hoveredSeat, setHoveredSeat] = useState(null);
@@ -227,7 +227,13 @@ const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSea
                                 data-tooltip={isEditingLayout ? 'Drag to move, bottom-right to resize' : formatTooltip(seat)}
                                 onMouseEnter={() => setHoveredSeat(seat.id)}
                                 onMouseLeave={() => setHoveredSeat(null)}
-                                onClick={() => !isEditingLayout && seat.is_actionable && onSeatClick && onSeatClick(seat)}
+                                onClick={() => {
+                                    if (isEditingLayout) {
+                                        if (setSelectedSeatId) setSelectedSeatId(selectedSeatId === seat.id ? null : seat.id);
+                                    } else if (seat.is_actionable && onSeatClick) {
+                                        onSeatClick(seat);
+                                    }
+                                }}
                                 onPointerDown={(e) => handlePointerDown(e, seat, false)}
                             >
                                 {isEditingLayout && (
@@ -260,6 +266,56 @@ const CameraOverlay = ({ seats = [], onSeatClick, config, isEditingLayout, onSea
                                         textShadow: '1px 1px 1px rgba(0,0,0,0.8)'
                                     }}>
                                         {confirmProg}
+                                    </div>
+                                )}
+
+                                {/* Floating Seat Editor Panel */}
+                                {isEditingLayout && selectedSeatId === seat.id && (
+                                    <div
+                                        className="seat-editor-panel"
+                                        style={{
+                                            position: 'absolute',
+                                            top: '100%', left: '50%', transform: 'translateX(-50%)',
+                                            marginTop: '8px',
+                                            background: '#1e293b', border: '1px solid #38bdf8',
+                                            borderRadius: '6px', padding: '8px', zIndex: 1000,
+                                            boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.5)',
+                                            display: 'flex', flexDirection: 'column', gap: '8px',
+                                            width: '180px', cursor: 'default'
+                                        }}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onPointerDown={(e) => e.stopPropagation()}
+                                    >
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                            <span style={{ color: '#94a3b8', fontSize: '11px', fontWeight: 'bold' }}>{seat.id}</span>
+                                            <button onClick={() => { if(setSelectedSeatId) setSelectedSeatId(null); }} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', padding: '2px' }}>✕</button>
+                                        </div>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                            <label style={{ fontSize: '11px', color: '#cbd5e1' }}>Zone</label>
+                                            <select
+                                                value={seat.zone}
+                                                onChange={(e) => onSeatUpdate({ ...seat, zone: e.target.value })}
+                                                style={{ background: '#0f172a', border: '1px solid #334155', color: '#f8fafc', padding: '4px', borderRadius: '4px', fontSize: '12px' }}
+                                            >
+                                                {zones.map(z => <option key={z.zone_name} value={z.zone_name}>{z.zone_name}</option>)}
+                                            </select>
+                                        </div>
+                                        <div style={{ display: 'flex', gap: '8px' }}>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1 }}>
+                                                <label style={{ fontSize: '11px', color: '#cbd5e1' }}>W</label>
+                                                <input type="number" value={Math.round(seat.width)} onChange={(e) => onSeatUpdate({ ...seat, width: Math.max(20, parseInt(e.target.value) || 20) })} style={{ background: '#0f172a', border: '1px solid #334155', color: '#f8fafc', padding: '4px', borderRadius: '4px', fontSize: '12px', width: '100%' }} />
+                                            </div>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1 }}>
+                                                <label style={{ fontSize: '11px', color: '#cbd5e1' }}>H</label>
+                                                <input type="number" value={Math.round(seat.height)} onChange={(e) => onSeatUpdate({ ...seat, height: Math.max(20, parseInt(e.target.value) || 20) })} style={{ background: '#0f172a', border: '1px solid #334155', color: '#f8fafc', padding: '4px', borderRadius: '4px', fontSize: '12px', width: '100%' }} />
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={() => { onSeatDelete(seat.id); if(setSelectedSeatId) setSelectedSeatId(null); }}
+                                            style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#ef4444', padding: '4px 8px', borderRadius: '4px', fontSize: '12px', cursor: 'pointer', marginTop: '4px' }}
+                                        >
+                                            Delete Seat
+                                        </button>
                                     </div>
                                 )}
                             </div>

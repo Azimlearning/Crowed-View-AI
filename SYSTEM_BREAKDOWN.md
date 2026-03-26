@@ -138,6 +138,10 @@ The system operates at **TRL 3** (Technology Readiness Level 3), demonstrating f
   - `seating_map.json` - Seat coordinates and zone mapping
   - `config.json` - Event configuration and thresholds
 
+#### 4. **Documentation**
+- **Location:** `docs/`
+- **Contents:** Project findings, AI agent plans, and progress tracking.
+
 ---
 
 ## User Flow

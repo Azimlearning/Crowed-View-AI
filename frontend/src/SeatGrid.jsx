@@ -116,13 +116,6 @@ const SeatGrid = ({ seats, onSeatClick, config, isEditingLayout }) => {
     return `${(seat.overlap_percentage * 100).toFixed(0)}% overlap`;
   };
 
-  const getSeatIcon = (seat) => {
-    if (seat.is_actionable) return '⚠️';
-    if (seat.status === 'Occupied') return '🔴';
-    if (seat.overlap_percentage >= overlapThreshold) return '🟡'; // Detecting
-    return '⬜';
-  };
-
   const formatTooltip = (seat) => {
     const overlapPct = seat.overlap_percentage != null
       ? (seat.overlap_percentage * 100).toFixed(1)
@@ -207,12 +200,18 @@ const SeatGrid = ({ seats, onSeatClick, config, isEditingLayout }) => {
                   onMouseEnter={() => setHoveredSeat(seat.id)}
                   onMouseLeave={() => setHoveredSeat(null)}
                   onClick={() => !isEditingLayout && seat.is_actionable && onSeatClick && onSeatClick(seat)}
-                  onPointerDown={(e) => handlePointerDown(e, seat.id)}
-                >
-                  <span style={{ fontSize: '20px', marginBottom: '4px' }}>
-                    {getSeatIcon(seat)}
-                  </span>
-                  <span className="seat-id" style={{ fontSize: '12px', textAlign: 'center' }}>
+                   role={seat.is_actionable && !isEditingLayout ? 'button' : undefined}
+                   tabIndex={seat.is_actionable && !isEditingLayout ? 0 : undefined}
+                   aria-label={seat.is_actionable ? `Seat ${seat.id} — actionable, click for AI suggestions` : undefined}
+                   onKeyDown={(e) => {
+                     if (e.key === 'Enter' || e.key === ' ') {
+                       e.preventDefault();
+                       if (!isEditingLayout && seat.is_actionable && onSeatClick) onSeatClick(seat);
+                     }
+                   }}
+                   onPointerDown={(e) => handlePointerDown(e, seat.id)}
+                 >
+                   <span className="seat-id" style={{ fontSize: '12px', textAlign: 'center' }}>
                     {seat.id}
                   </span>
                   <span style={{ fontSize: '10px', opacity: 0.9, marginTop: '2px' }}>

@@ -25,8 +25,11 @@ from models import (
     SeatStatusResponse, ZoneStatsResponse, SuggestionRequest, SuggestionResponse,
     ConfigUpdateRequest, Seat, Zone
 )
-from vision_engine import VisionEngine
 from logger_config import setup_logging, get_logger
+from vision_engine import VisionEngine
+
+# Model ID for OpenRouter AI calls
+MODEL_ID = "google/gemini-2.0-flash-001"
 
 # Setup logging
 setup_logging(os.getenv("LOG_LEVEL", "INFO"))
@@ -39,11 +42,18 @@ _zone_stats_cache = {
     'ttl': 2.0  # Cache for 2 seconds
 }
 
-# Initialize paths
+# Setup file paths
 BASE_DIR = Path(__file__).parent.parent
-SEATING_MAP_PATH = BASE_DIR / "data" / "seating_map.json"
-CONFIG_PATH = BASE_DIR / "data" / "config.json"
+DATA_DIR = BASE_DIR / "data"
+CONFIG_PATH = DATA_DIR / "config.json"
+SEATING_MAP_PATH = DATA_DIR / "seating_map.json"
+LOG_DB_PATH = DATA_DIR / "seating_history.db"
+BACKGROUND_IMG_PATH = DATA_DIR / "layout_background.jpg"
+LAYOUTS_DIR = DATA_DIR / "layouts"
 
+# Ensure data and layouts directories exist
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+LAYOUTS_DIR.mkdir(parents=True, exist_ok=True)
 # Load environment variables from project root
 load_dotenv(BASE_DIR / ".env")
 
@@ -87,6 +97,18 @@ app.add_middleware(
 async def root():
     """Root endpoint."""
     return {"message": "Venue Intelligence AI API", "status": "running"}
+
+@app.get("/api/rtsp-status")
+async def get_rtsp_status():
+    """Returns the current RTSP connection status."""
+    global vision_engine
+    if not vision_engine:
+        return {"connected": False, "error": "Vision engine not initialized"}
+        
+    return {
+        "connected": getattr(vision_engine, '_rtsp_connected', False),
+        "error": getattr(vision_engine, '_rtsp_error_message', None)
+    }
 
 
 @app.get("/api/debug-seat-map", response_class=Response)
@@ -349,8 +371,9 @@ async def auto_calibrate(strategy: str = Query("auto", description="Strategy: au
             
             base64_img = base64.b64encode(jpeg_bytes).decode('utf-8')
             
-            response = client.chat.completions.create(
-                model="google/gemini-2.0-flash-lite-preview-02-05:free",
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=MODEL_ID,
                 messages=[
                     {
                         "role": "user",
@@ -457,8 +480,9 @@ async def upload_layout_image(file: UploadFile = File(...)):
         base64_img = base64.b64encode(contents).decode('utf-8')
         mime_type = file.content_type or "image/jpeg"
         
-        response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=MODEL_ID,
             messages=[
                 {
                     "role": "user",
@@ -656,8 +680,9 @@ async def get_analytics_insights():
             f"Keep the tone professional and data-driven. Do not use markdown headers — plain readable text only."
         )
 
-        response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=MODEL_ID,
             messages=[{"role": "user", "content": prompt}]
         )
         insight_text = response.choices[0].message.content.strip()
@@ -673,6 +698,85 @@ async def get_analytics_insights():
         logger.error(f"Analytics insights generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analytics generation failed: {str(e)}")
 
+
+from pydantic import BaseModel
+class LayoutRenameRequest(BaseModel):
+    new_name: str
+
+@app.get("/api/layouts")
+async def list_layouts():
+    """List all saved seating layout profiles."""
+    if not LAYOUTS_DIR.exists():
+        return {"layouts": []}
+    
+    layouts = []
+    for f in LAYOUTS_DIR.glob("*.json"):
+        layouts.append(f.stem)
+    return {"layouts": sorted(layouts)}
+
+@app.post("/api/layouts/save")
+async def save_layout(request: dict):
+    """Save the current seating layout as a named profile."""
+    name = request.get("name")
+    zones = request.get("zones")
+    if not name or zones is None:
+        raise HTTPException(status_code=400, detail="Missing name or zones")
+        
+    file_path = LAYOUTS_DIR / f"{name}.json"
+    with open(file_path, "w") as f:
+        json.dump(request, f, indent=2)
+        
+    return {"message": f"Layout '{name}' saved successfully"}
+
+@app.get("/api/layouts/load/{name}")
+async def load_layout(name: str):
+    """Load a specific seating layout profile."""
+    file_path = LAYOUTS_DIR / f"{name}.json"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Layout '{name}' not found")
+        
+    with open(file_path, "r") as f:
+        data = json.load(f)
+        
+    return data
+
+@app.delete("/api/layouts/{name}")
+async def delete_layout(name: str):
+    """Delete a seating layout profile."""
+    file_path = LAYOUTS_DIR / f"{name}.json"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Layout '{name}' not found")
+        
+    file_path.unlink()
+    return {"message": f"Layout '{name}' deleted"}
+
+@app.patch("/api/layouts/{name}/rename")
+async def rename_layout(name: str, body: LayoutRenameRequest):
+    """Rename a seating layout profile."""
+    old_path = LAYOUTS_DIR / f"{name}.json"
+    if not old_path.exists():
+        raise HTTPException(status_code=404, detail=f"Layout '{name}' not found")
+    
+    new_name = body.new_name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="New name cannot be empty")
+        
+    new_path = LAYOUTS_DIR / f"{new_name}.json"
+    if new_path.exists():
+        raise HTTPException(status_code=400, detail=f"Layout '{new_name}' already exists")
+        
+    # Also update the 'name' field inside the JSON if it exists
+    try:
+        with open(old_path, 'r') as f:
+            data = json.load(f)
+        data['name'] = new_name
+        with open(old_path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to update internal name for layout {name}: {e}")
+        
+    old_path.rename(new_path)
+    return {"success": True, "name": new_name}
 
 @app.post("/api/suggestions", response_model=SuggestionResponse)
 async def get_suggestions(request: SuggestionRequest):
@@ -743,8 +847,9 @@ async def get_suggestions(request: SuggestionRequest):
             f"Each suggestion must start with the category in brackets, e.g. [Energy] or [Venue]."
         )
         
-        response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-lite-preview-02-05:free",
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=MODEL_ID,
             messages=[{"role": "user", "content": prompt}]
         )
         suggestions_text = response.choices[0].message.content.strip()
